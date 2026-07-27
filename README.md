@@ -13,70 +13,15 @@
 
 ---
 
-<p align="center">
-  <b>🇨🇳 中文</b> | <a href="#english">🇬🇧 English</a>
-</p>
+[**中文文档**](README.zh-CN.md) | **English**
 
 ---
 
-<h2>🇨🇳 什么是 jelly-code？</h2>
-
-**jelly-code 不是一个代码搜索工具。它是一个能真正"理解"代码的知识图谱引擎。**
-
-AI 助手（Claude Code、Cursor、Windsurf 等）通过 33+ 个 MCP 工具，可以直接查询你的代码库——不是靠关键词匹配，而是靠语义理解：符号、调用链、继承关系、API 路由、代码的演化历史。
-
-### 两大核心创新
-
-| 传统方式 | jelly-code 的做法 |
-|---------|-----------------|
-| 手动写文档，写完了就过期 | **自动发现文档**，代码变了自动标记过期 |
-| git log 看"改了哪些文件" | **代码时光机**，问"这个函数是怎么演变的？" |
-| grep 搜关键词 | 语义图查询：调用链、继承、API 影响分析 |
-| 每个 AI 工具需要手动加载上下文 | **33+ MCP 工具**，按需查询，不占窗口 |
-
-### 快速开始
-
-```bash
-# 1. 安装
-git clone https://github.com/datanaan/jelly-code
-cd jelly-code && npm install && npm run build
-
-# 2. 启动基础设施
-docker compose up -d
-
-# 3. 分析你的项目
-npx jelly-code analyze /path/to/your-project
-
-# 4. 启动 MCP 服务
-npx jelly-code mcp
-```
-
-然后任何 MCP 客户端连接 `http://localhost:8095/mcp` 即可。
-
-### 支持 14 种语言
-
-JavaScript / TypeScript · Python · Java · Go · Rust · C / C++ · C# · PHP · Ruby · Kotlin · Swift · Dart · COBOL
-
-### 架构
-
-```
-AI Client ── MCP ──▶ Express Server
-                        │
-               Scan → Parse → Resolve → Enrich
-                        │
-              ┌─────────┼─────────┐
-              ▼         ▼         ▼
-           Neo4j    Typesense   Qdrant
-          (图谱)    (全文搜索)   (向量)
-```
-
----
-
-<h2 id="english">🇬🇧 What is jelly-code?</h2>
+## What is jelly-code?
 
 **jelly-code is not a code search tool. It's a knowledge graph engine that actually understands your code.**
 
-It exposes **33+ MCP tools** so AI assistants can navigate your codebase without manual context loading — not by keyword matching, but by semantic understanding: symbols, imports, call chains, inheritance, API routes, and evolution over time.
+It exposes **33+ MCP tools** so AI assistants (Claude Code, Cursor, Windsurf, etc.) can navigate your codebase without manual context loading — not by keyword matching, but by semantic understanding: symbols, imports, call chains, inheritance, API routes, and evolution over time.
 
 ### Two Innovations That Set It Apart
 

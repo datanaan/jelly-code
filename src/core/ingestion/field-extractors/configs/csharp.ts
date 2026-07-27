@@ -1,4 +1,4 @@
-// field-extractors/configs/csharp.ts
+// src/core/ingestion/field-extractors/configs/csharp.ts
 
 import { SupportedLanguages } from '@shared';
 import type { FieldExtractionConfig } from '../generic.js';

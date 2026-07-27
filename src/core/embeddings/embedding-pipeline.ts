@@ -15,15 +15,13 @@ import {
   embedText,
   embeddingToArray,
   isEmbedderReady,
+  getEmbeddingDimensions,
 } from './embedder.js';
 import { generateBatchEmbeddingTexts } from './text-generator.js';
 import type { EmbeddableNode } from './types.js';
 import { DEFAULT_EMBEDDING_CONFIG } from './types.js';
 
 const isDev = process.env.NODE_ENV === 'development';
-
-/** Vector dimension for the embedding model (all-MiniLM-L6-v2 / snowflake-arctic-embed-xs) */
-const VECTOR_DIMENSION = 384;
 
 export class EmbeddingPipeline {
   constructor(private vectorStore: IVectorStore) {}
@@ -62,8 +60,10 @@ export class EmbeddingPipeline {
   ): Promise<void> {
     if (nodes.length === 0) return;
 
-    // Ensure the vector store collection exists
-    await this.vectorStore.ensureCollection(projectId, VECTOR_DIMENSION);
+    // Ensure the vector store collection exists with the correct dimensions
+    // for the active embedding mode (local=384, http-pool/legacy=CODE_EMBEDDING_DIMS)
+    const dims = getEmbeddingDimensions();
+    await this.vectorStore.ensureCollection(projectId, dims);
 
     // Ensure embedder is ready
     if (!isEmbedderReady()) {

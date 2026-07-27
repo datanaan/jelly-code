@@ -28,7 +28,7 @@ export interface McpServerOptions {
 export function createMcpServer(stores: StoreSet, options?: McpServerOptions): McpServer {
   const server = new McpServer({
     name: options?.name ?? 'jelly-code',
-    version: options?.version ?? '0.1.0',
+    version: options?.version ?? '1.1.4',
   });
 
   // Register all tools

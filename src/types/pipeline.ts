@@ -1,5 +1,5 @@
 /**
- * Pipeline result types.
+ * Pipeline result types — replaces jelly-code's ../../types/pipeline.js
  *
  * This is the canonical definition of what the ingestion pipeline returns.
  * Moved from run-analyze.ts inline definition to a shared module.

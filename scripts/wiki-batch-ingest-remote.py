@@ -8,7 +8,7 @@ by sending file content via REST API (no filesystem access needed).
 Uses single-file /api/wiki/ingest endpoint for reliability.
 
 Usage:
-    python wiki-batch-ingest-remote.py /path/to/docs --project-id my-project --url http://localhost:8095 --key your-api-key
+    python wiki-batch-ingest-remote.py /path/to/docs --project-id my-project --url http://172.80.1.198:8095 --key dev_key_1
     python wiki-batch-ingest-remote.py /path/to/docs --project-id my-project --batch-size 10 --pattern "**/*.md"
 """
 
@@ -57,7 +57,7 @@ def ingest_single(
 def main():
     parser = argparse.ArgumentParser(description="Batch ingest docs into remote Jelly Code wiki")
     parser.add_argument("directory", help="Directory containing markdown files")
-    parser.add_argument("--url", default="http://localhost:8095", help="jelly-code server URL")
+    parser.add_argument("--url", default="http://172.80.1.198:8095", help="Jelly Code server URL")
     parser.add_argument("--key", default="dev_key_1", help="API key")
     parser.add_argument("--project-id", required=True, help="Project ID for multi-tenant isolation")
     parser.add_argument("--pattern", default="**/*.md", help="Glob pattern for files")

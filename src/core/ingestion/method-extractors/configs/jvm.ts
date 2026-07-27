@@ -1,4 +1,4 @@
-// method-extractors/configs/jvm.ts
+// src/core/ingestion/method-extractors/configs/jvm.ts
 
 import { SupportedLanguages } from '@shared';
 import type {

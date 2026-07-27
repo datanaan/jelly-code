@@ -82,6 +82,7 @@ export function parseNaturalLanguageTime(
     tryEpochNumber(trimmed) ??
     tryRelativeTime(trimmed, now) ??
     tryCommonPhrase(trimmed, now) ??
+    trySinceDatePrefix(trimmed) ??
     tryTagBased(trimmed, now, tagResolver);
 
   if (result === null) {
@@ -212,6 +213,31 @@ function tryCommonPhrase(input: string, now: Date): string | null {
     default:
       return null;
   }
+}
+
+/**
+ * v1.3.0 Phase 3 T3-5: Try "since/after/before <ISO date>" patterns.
+ *
+ *   "since 2026-07-01"        → "2026-07-01T00:00:00Z"
+ *   "after 2026-06-15"        → "2026-06-15T00:00:00Z"
+ *   "before 2026-12-31"       → "2026-12-31T00:00:00Z"
+ *
+ * The directional prefix is semantically meaningful for query intent
+ * (before vs after filtering), but both resolve to the same timestamp.
+ * The caller's query logic handles the direction.
+ *
+ * Unlike tryTagBased (which handles version tags like "v1.0"), this
+ * handles ISO dates directly without needing a tagResolver.
+ */
+function trySinceDatePrefix(input: string): string | null {
+  const match = input.match(
+    /^(since|after|before|from)\s+(\d{4}-\d{2}-\d{2}(?:T[\d:.]+(?:Z|[+-]\d{2}:\d{2}))?)$/i,
+  );
+  if (!match) return null;
+
+  const dateStr = match[2];
+  // Reuse tryIso8601 for validation + normalization
+  return tryIso8601(dateStr);
 }
 
 /**

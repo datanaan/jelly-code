@@ -8,12 +8,20 @@
 
 import express from 'express';
 import cors from 'cors';
+import { readFileSync } from 'fs';
+import { fileURLToPath } from 'url';
+import { dirname, resolve } from 'path';
 import { loadConfig } from '../config/index.js';
 import { createStoreSet } from '../store/factory.js';
 import { createAuthProvider } from '../auth/factory.js';
 import { createAuthMiddleware, createQuotaMiddleware } from '../auth/middleware.js';
-import { runAnalyze } from '../core/run-analyze.js';
-import { runIncrementalAnalyze } from '../core/run-incremental.js';
+import { validateRepoPath } from '../core/run-analyze.js';
+
+// Read version from package.json at build time
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const pkg = JSON.parse(readFileSync(resolve(__dirname, '../../package.json'), 'utf-8'));
+const APP_VERSION: string = pkg.version;
 import { createTaskManager } from '../task/index.js';
 import type { TaskManager } from '../task/index.js';
 import { createMcpServer } from '../mcp/server.js';
@@ -26,6 +34,14 @@ import { createCodeRoutes } from './code-routes.js';
 import { IncrementalScheduler } from './scheduler.js';
 import type { StoreSet } from '../store/interfaces.js';
 import type { IAuthProvider } from '../store/interfaces.js';
+import { logger } from '../core/logger.js';
+import { analyzeQueue, cleanupQueue, closeQueues, closeResilienceQueues } from '../core/queue-setup.js';
+import { closeRedisConnection } from '../core/redis-connection.js';
+import rateLimit from 'express-rate-limit';
+import { metricsHandler } from '../core/metrics.js';
+import { createHealthRouter } from './health-routes.js';
+import { LLMService } from '../llm/llm-service.js';
+import path from 'path';
 
 const config = loadConfig();
 const stores = createStoreSet(config);
@@ -37,12 +53,40 @@ const repoCache = new RepoCacheManager(config.repo);
 const taskManager = createTaskManager();
 
 const app = express();
-app.use(cors());
+// CORS whitelist: allow specific origins, default to localhost for dev
+const allowedOrigins = (process.env.CORS_ORIGINS || 'http://localhost:5173,http://localhost:4173').split(',').map(s => s.trim());
+app.use(cors({
+  origin: (origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void) => {
+    // Allow requests with no origin (server-to-server, curl, etc.)
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      logger.warn({ origin }, 'CORS blocked request from unauthorized origin');
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,
+}));
+
+// Global rate limit: 100 requests per minute per IP
+const globalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: parseInt(process.env.RATE_LIMIT_GLOBAL || '100', 10),
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests — rate limit exceeded' },
+});
+app.use(globalLimiter);
 app.use(express.json({ limit: '10mb' }));
 
 // ========================================
 // Health check (no auth required)
+// Checks all three backends: Neo4j, Typesense, Qdrant
+// Returns HTTP 200 if all healthy, 503 if any backend is down
 // ========================================
+// Prometheus metrics endpoint (no auth required, no rate limit)
+app.get('/metrics', metricsHandler);
+
 app.get('/health', async (_req, res) => {
   let neo4jStatus = 'unknown';
   let constraintWarnings: string[] = [];
@@ -94,14 +138,52 @@ app.get('/health', async (_req, res) => {
     constraintWarnings.push(`Constraint check failed: ${e instanceof Error ? e.message : String(e)}`);
   }
 
-  res.json({
-    status: neo4jStatus === 'ok' ? 'ok' : 'degraded',
+  // Check Typesense health
+  let tsStatus = 'unknown';
+  try {
+    if (stores.search.healthCheck) {
+      tsStatus = (await stores.search.healthCheck()) ? 'ok' : 'error';
+    } else {
+      tsStatus = 'unknown';
+    }
+  } catch (e) {
+    tsStatus = 'error';
+  }
+
+  // Check Qdrant health
+  let qdStatus = 'unknown';
+  try {
+    if (stores.vector.healthCheck) {
+      qdStatus = (await stores.vector.healthCheck()) ? 'ok' : 'error';
+    } else {
+      qdStatus = 'unknown';
+    }
+  } catch (e) {
+    qdStatus = 'error';
+  }
+
+  // m2: 'unknown' status counts as degraded — triggers 503 so monitoring knows
+  // a backend exists but hasn't been verified. All three must be 'ok' for 200.
+  const allOk = neo4jStatus === 'ok' && tsStatus === 'ok' && qdStatus === 'ok';
+  const anyError = neo4jStatus === 'error' || tsStatus === 'error' || qdStatus === 'error';
+  const anyUnknown = neo4jStatus === 'unknown' || tsStatus === 'unknown' || qdStatus === 'unknown';
+  const overallStatus = allOk ? 'ok' : 'degraded';
+  const httpStatus = allOk ? 200 : 503;
+
+  if (anyError || anyUnknown) {
+    logger.warn({ neo4j: neo4jStatus, typesense: tsStatus, qdrant: qdStatus }, 'Health check: backend degraded');
+  }
+
+  res.status(httpStatus).json({
+    status: overallStatus,
     mode: config.deployMode,
-    version: '1.0.0',
+    version: APP_VERSION,
     neo4j: {
       status: neo4jStatus,
       constraints: constraintWarnings.length === 0 ? 'valid' : constraintWarnings,
     },
+    typesense: { status: tsStatus },
+    qdrant: { status: qdStatus },
   });
 });
 
@@ -159,11 +241,28 @@ app.get('/health/consistency', async (_req, res) => {
 });
 
 // ========================================
+// v1.4.0 Resilience layer health endpoints
+// Mounted before auth so k8s/docker probes can reach them.
+// ========================================
+const llmService = stores.llm instanceof LLMService ? stores.llm as LLMService : undefined;
+app.use(createHealthRouter({ llmService }));
+
+// ========================================
 // Authenticated API routes
 // ========================================
 app.use('/api/*', authMiddleware, quotaMiddleware);
 
-app.post('/api/analyze', async (req, res) => {
+// Analyze-specific rate limit: 10 requests per minute
+const analyzeLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: parseInt(process.env.RATE_LIMIT_ANALYZE || '10', 10),
+  standardHeaders: true,
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
+  message: { error: 'Too many analysis requests — limit is 10 per minute' },
+});
+
+app.post('/api/analyze', analyzeLimiter, async (req, res) => {
   try {
     const { gitUrl, projectId, repoPath } = req.body;
 
@@ -173,6 +272,15 @@ app.post('/api/analyze', async (req, res) => {
 
     if (!gitUrl && !repoPath) {
       return res.status(400).json({ error: 'gitUrl or repoPath is required' });
+    }
+
+    // Path traversal protection: validate repoPath if provided
+    if (repoPath) {
+      try {
+        validateRepoPath(repoPath);
+      } catch (e) {
+        return res.status(400).json({ error: e instanceof Error ? e.message : 'Invalid repoPath' });
+      }
     }
 
     // Dedup check
@@ -186,32 +294,13 @@ app.post('/api/analyze', async (req, res) => {
       });
     }
 
-    // Submit to TaskManager
-    await taskManager.requestAnalyze(projectId, { repoPath, gitUrl });
-
-    setImmediate(async () => {
-      taskManager.markAnalyzing(projectId);
-      try {
-        console.log(`[api:analyze] Starting analysis: projectId=${projectId}`);
-        await runAnalyze(
-          repoPath || '',
-          projectId,
-          stores,
-          {
-            gitUrl: gitUrl || undefined,
-            repoCache,
-            onProgress: (phase, percent) => {
-              taskManager.updateProgress(projectId, { phase, percent });
-            },
-          },
-        );
-        taskManager.markReady(projectId);
-        console.log(`[api:analyze] Analysis completed: ${projectId}`);
-      } catch (error: unknown) {
-        const msg = error instanceof Error ? error.message : String(error);
-        console.error(`[api:analyze] Analysis FAILED for ${projectId}: ${msg}`);
-        taskManager.markError(projectId, msg);
-      }
+    // Submit to BullMQ queue (persistent, with retry and timeout)
+    // M3: REST now uses analyzeQueue (same path as MCP analyze_repo)
+    await analyzeQueue.add('analyze', {
+      projectId,
+      gitUrl: gitUrl || undefined,
+      repoPath: repoPath || undefined,
+      canAutoIncremental: false,
     });
 
     res.json({ status: 'queued', projectId, hint: 'Use /api/status/:projectId to check progress.' });
@@ -228,18 +317,13 @@ app.post('/api/incremental-analyze', async (req, res) => {
       return res.status(400).json({ error: 'projectId is required' });
     }
 
-    setImmediate(async () => {
-      try {
-        console.log(`[api:incremental-analyze] Starting: projectId=${projectId}`);
-        const result = await runIncrementalAnalyze(projectId, stores, repoCache);
-        console.log(`[api:incremental-analyze] Completed: ${projectId} — mode=${result.mode}`);
-      } catch (error: unknown) {
-        const msg = error instanceof Error ? error.message : String(error);
-        console.error(`[api:incremental-analyze] FAILED for ${projectId}: ${msg}`);
-      }
+    // Enqueue incremental analysis via BullMQ (consistent with MCP path)
+    await analyzeQueue.add('analyze', {
+      projectId,
+      canAutoIncremental: true,
     });
 
-    res.json({ status: 'started', projectId });
+    res.json({ status: 'queued', projectId, hint: 'Incremental analysis queued. Use /api/status/:projectId to check.' });
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -257,11 +341,32 @@ app.get('/api/projects', async (_req, res) => {
 app.delete('/api/projects/:projectId', async (req, res) => {
   try {
     const { projectId } = req.params;
-    await stores.graph.clearProject(projectId);
-    await stores.search.deleteCollection(projectId);
-    await stores.vector.deleteCollection(projectId);
-    res.json({ status: 'deleted', projectId });
+
+    // Mark project as deleting in Neo4j (lightweight, always succeeds)
+    try {
+      await stores.graph.query(
+        'MATCH (p:Project {id: $id}) SET p.status = "deleting"',
+        { id: projectId },
+      );
+      logger.info({ projectId }, 'Project marked as deleting');
+    } catch (e) {
+      // Project may not exist — non-fatal
+      logger.warn({ projectId, error: e instanceof Error ? e.message : String(e) },
+        'Project mark as deleting failed');
+    }
+
+    // Enqueue cleanup job (async: Neo4j + Typesense + Qdrant)
+    await cleanupQueue.add('cleanup', { projectId }, {
+      attempts: 3,
+      backoff: { type: 'exponential', delay: 5000 },
+    });
+
+    logger.info({ projectId }, 'Cleanup job queued');
+
+    res.json({ status: 'deleting', projectId, hint: 'Cleanup is running in the background.' });
   } catch (error) {
+    logger.error({ error: error instanceof Error ? error.message : String(error) },
+      'Project deletion queuing failed');
     res.status(500).json({ error: 'Internal server error' });
   }
 });
@@ -370,7 +475,8 @@ app.post('/mcp', authMiddleware, async (req, res) => {
     await server.connect(transport);
     await transport.handleRequest(req, res, req.body);
   } catch (error) {
-    console.error('[mcp] Error handling MCP request:', error);
+    logger.error({ error: error instanceof Error ? error.message : String(error) },
+      'MCP request handling failed');
 
     if (!res.headersSent) {
       res.status(500).json({
@@ -407,17 +513,13 @@ app.post('/api/webhook/git-push', authMiddleware, async (req, res) => {
       return res.status(404).json({ error: 'No matching project found' });
     }
 
-    // Trigger incremental analysis (fire-and-forget)
+    // Trigger incremental analysis via BullMQ queue (consistent with MCP path)
     const triggered: string[] = [];
     for (const p of projects as Array<Record<string, unknown>>) {
       const projectId = p.id as string;
-      setImmediate(async () => {
-        try {
-          const result = await runIncrementalAnalyze(projectId, stores, repoCache);
-          console.log(`[webhook] ${projectId}: ${result.mode}, ${result.nodeCount} nodes`);
-        } catch (err) {
-          console.error(`[webhook] ${projectId}: FAILED: ${err instanceof Error ? err.message : err}`);
-        }
+      await analyzeQueue.add('analyze', {
+        projectId,
+        canAutoIncremental: true,
       });
       triggered.push(projectId);
     }
@@ -453,10 +555,45 @@ async function startServer() {
   // Initialize Neo4j schema
   try {
     await stores.graph.initializeSchema();
-    console.log('[server] Neo4j schema initialized');
+    logger.info('Neo4j schema initialized');
   } catch (error) {
-    console.warn('[server] Neo4j schema init failed (will retry on next request):', error);
+    logger.warn({ error: error instanceof Error ? error.message : String(error) },
+      'Neo4j schema init failed (will retry on next request)');
   }
+
+  // Start BullMQ workers in-process
+  // 1. analysis-worker — processes 'analyze' queue jobs
+  // 2. search-sync-worker — async TS/QD index sync after analysis
+  // 3. cleanup-worker — project deletion and stale node cleanup
+  // 4. llm-worker — v1.4.0: consumes llm-derivation + llm-enrichment queues
+  const repoCacheForWorkers = repoCache;
+  const { createAnalysisWorker } = await import('../worker/analysis-worker.js');
+  const { createSearchSyncWorker } = await import('../worker/search-sync-worker.js');
+  const { createCleanupWorker } = await import('../worker/cleanup-worker.js');
+  const { createLLMWorker } = await import('../worker/llm-worker.js');
+  const { loadRules } = await import('../wiki/derivation-rules.js');
+
+  const analysisWorker = createAnalysisWorker(stores, repoCacheForWorkers, taskManager, wikiService);
+  const searchSyncWorker = createSearchSyncWorker(stores);
+  const cleanupWorker = createCleanupWorker(stores);
+
+  // Start llm-worker with default derivation rules (enabled unless user config says otherwise).
+  // Rules are loaded from the built-in default; per-project overrides are resolved at dispatch time.
+  const defaultRulesPath = path.join(
+    path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'config', 'derivation-rules.json',
+  );
+  let llmRules: import('../wiki/derivation-rules.js').DerivationRules = { enabled: true, rules: [], maxEntitiesPerProject: 100 };
+  try {
+    llmRules = loadRules(defaultRulesPath);
+  } catch {
+    logger.warn({ path: defaultRulesPath }, 'Failed to load default derivation rules, using minimal defaults');
+  }
+  const llmWorkers = createLLMWorker({
+    stores, wikiService, pool: stores.llm, rules: llmRules,
+  });
+  const [llmDerivationWorker, llmEnrichmentWorker] = llmWorkers;
+
+  logger.info('BullMQ workers started: analysis, search-sync, cleanup, llm');
 
   // Start auto-refresh scheduler (disabled by default: AUTO_REFRESH_INTERVAL_MINUTES=0)
   const AUTO_REFRESH_INTERVAL = parseInt(process.env.AUTO_REFRESH_INTERVAL_MINUTES || '0', 10);
@@ -467,30 +604,64 @@ async function startServer() {
     scheduler.startArchiveJob(config.bitemporal.retentionDays);
     // Register monthly evolution story batch job
     scheduler.startEvolutionBatchJob();
-    console.log(`[server] Auto-refresh enabled: every ${AUTO_REFRESH_INTERVAL} minutes`);
+    logger.info({ interval: AUTO_REFRESH_INTERVAL }, 'Auto-refresh enabled');
   } else {
-    console.log('[server] Auto-refresh disabled (AUTO_REFRESH_INTERVAL_MINUTES=0)');
+    logger.info('Auto-refresh disabled (AUTO_REFRESH_INTERVAL_MINUTES=0)');
   }
 
   const server = app.listen(config.port, () => {
-    console.log(
-      `[server] jelly_code_project running on port ${config.port} (${config.deployMode} mode)`,
+    logger.info(
+      { port: config.port, mode: config.deployMode },
+      `jelly_code_project running on port ${config.port} (${config.deployMode} mode)`,
     );
-    console.log(`[server] REST API: http://localhost:${config.port}/api`);
-    console.log(`[server] MCP endpoint: http://localhost:${config.port}/mcp`);
+    logger.info({ port: config.port }, `REST API: http://localhost:${config.port}/api`);
+    logger.info({ port: config.port }, `MCP endpoint: http://localhost:${config.port}/mcp`);
   });
 
   server.on('error', (error: NodeJS.ErrnoException) => {
     if (error.code === 'EADDRINUSE') {
-      console.error(`[server] Port ${config.port} is already in use. Exiting.`);
+      logger.error({ port: config.port }, 'Port already in use. Exiting.');
       process.exit(1);
     } else {
       throw error;
     }
   });
+
+  // Graceful shutdown: close workers, queues, Redis
+  // v1.4.0: also close resilience-layer queues (llm-derivation, llm-enrichment, embedding-batch).
+  //         Resilience workers (llmDerivationWorker etc.) will be added by Task 10-12;
+  //         until then they are undefined and skipped via optional chaining.
+  const shutdown = async (signal?: string) => {
+    logger.info({ signal }, 'Shutdown received, draining workers');
+    // 1. Stop accepting new HTTP requests
+    server.close();
+    // 2. Close BullMQ workers (stop pulling new jobs, wait for in-flight)
+    await Promise.allSettled([
+      analysisWorker.close(),
+      searchSyncWorker.close(),
+      cleanupWorker.close(),
+      llmDerivationWorker.close(),
+      llmEnrichmentWorker.close(),
+    ]);
+    // 3. Close resilience-layer queues
+    await closeResilienceQueues();
+    // 4. Close core queues + stores + Redis
+    await Promise.allSettled([
+      closeQueues(),
+      closeRedisConnection(),
+    ]);
+    await stores.close();
+    process.exit(0);
+  };
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
-startServer().catch(console.error);
+startServer().catch((err) => {
+  logger.error({ error: err instanceof Error ? err.message : String(err) }, 'Server startup failed');
+  process.exit(1);
+});
 
 // Export for testing
 export { app, stores, authProvider, wikiService };

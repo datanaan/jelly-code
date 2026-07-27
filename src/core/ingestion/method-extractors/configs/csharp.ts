@@ -1,4 +1,4 @@
-// method-extractors/configs/csharp.ts
+// src/core/ingestion/method-extractors/configs/csharp.ts
 
 import { SupportedLanguages } from '@shared';
 import type {

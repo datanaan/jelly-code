@@ -1,4 +1,4 @@
-// field-extractors/typescript.ts
+// src/core/ingestion/field-extractors/typescript.ts
 
 import type { SyntaxNode } from '../utils/ast-helpers.js';
 import { SupportedLanguages } from '@shared';

@@ -9,13 +9,15 @@ import type {
 } from '../interfaces.js';
 import type { Neo4jConfig } from '../../config/index.js';
 import { initializeSchema, quoteLabel } from './schema.js';
+import { getSafeQuery, SAFE_CYPHER_TEMPLATES } from './safe-queries.js';
+import { logger } from '../../core/logger.js';
 
 /**
  * Neo4j implementation of IGraphStore.
  *
  * Design decisions:
  * - All relations use a single `CODE_RELATION` type with a `type` property
- *   for the semantic relation (CALLS, IMPORTS, ...)
+ *   for the semantic relation (CALLS, IMPORTS, ...), matching jelly-code.
  * - Every node carries `projectId` and every query filters on it for
  *   multi-tenant isolation.
  * - Labels that collide with Cypher reserved words are backtick-quoted.
@@ -24,6 +26,8 @@ import { initializeSchema, quoteLabel } from './schema.js';
  */
 export class Neo4jAdapter implements IGraphStore {
   private driver: neo4j.Driver;
+  /** Last write operation duration in ms (for Prometheus metrics) */
+  _lastWriteDurationMs = 0;
 
   constructor(private config: Neo4jConfig) {
     this.driver = neo4j.driver(
@@ -112,7 +116,7 @@ export class Neo4jAdapter implements IGraphStore {
 
   async getNode(projectId: string, nodeId: string): Promise<CodeNode | null> {
     const results = await this.readQuery(
-      `MATCH (n:CodeElement {id: $nodeId, projectId: $projectId})
+      `MATCH (n {id: $nodeId, projectId: $projectId})
        RETURN n`,
       { projectId, nodeId },
     );
@@ -319,10 +323,11 @@ export class Neo4jAdapter implements IGraphStore {
         return clean;
       });
 
-      // Process in batches of 500
-      const batchSize = 500;
-      for (let i = 0; i < rows.length; i += batchSize) {
-        const batch = rows.slice(i, i + batchSize);
+      // Process in batches (configurable via NEO4J_NODE_BATCH_SIZE env, default 5000)
+      const nodeBatchSize = parseInt(process.env.NEO4J_NODE_BATCH_SIZE || '5000', 10);
+      const startTime = Date.now();
+      for (let i = 0; i < rows.length; i += nodeBatchSize) {
+        const batch = rows.slice(i, i + nodeBatchSize);
         await this.writeQuery(
           `UNWIND $rows AS row
            MERGE (n:${qLabel} {id: row.id, projectId: row.projectId})
@@ -330,6 +335,9 @@ export class Neo4jAdapter implements IGraphStore {
           { rows: batch },
         );
       }
+      this._lastWriteDurationMs = Date.now() - startTime;
+      logger.debug({ type, count: rows.length, batchSize: nodeBatchSize, durationMs: this._lastWriteDurationMs },
+        'Neo4j batch nodes written');
     }
   }
 
@@ -339,7 +347,7 @@ export class Neo4jAdapter implements IGraphStore {
     const rows = relations.map(r => ({ ...r }));
 
     // Batch-resolve node labels for all source/target IDs to avoid label-less MATCH (full table scan).
-    // We query in chunks to stay within UNWIND performance bounds.
+    // Single full query (more efficient than multiple round trips).
     const allIds = new Set<string>();
     for (const r of rows) {
       allIds.add(r.sourceId as string);
@@ -349,9 +357,10 @@ export class Neo4jAdapter implements IGraphStore {
     const projectId = (rows[0] as Record<string, unknown>).projectId as string;
 
     const idToLabel = new Map<string, string>();
-    const labelBatchSize = 2000;
-    for (let i = 0; i < idArray.length; i += labelBatchSize) {
-      const batch = idArray.slice(i, i + labelBatchSize);
+    // Use a single full query instead of batched queries for better performance
+    const maxBatchSize = parseInt(process.env.NEO4J_LABEL_BATCH_SIZE || '50000', 10);
+    for (let i = 0; i < idArray.length; i += maxBatchSize) {
+      const batch = idArray.slice(i, i + maxBatchSize);
       const results = await this.readQuery(
         `MATCH (n) WHERE n.projectId = $projectId AND n.id IN $ids
          RETURN n.id AS id, labels(n)[0] AS label`,
@@ -500,9 +509,37 @@ export class Neo4jAdapter implements IGraphStore {
   async query(cypher: string, params: Record<string, unknown> = {}): Promise<Record<string, unknown>[]> {
     // Auto-detect write queries: MERGE, CREATE, SET, DELETE, DETACH, REMOVE
     const isWrite = /\b(MERGE|CREATE|SET|DELETE|DETACH|REMOVE)\b/i.test(cypher);
+    // Ensure numeric parameters are integers (Neo4j JS driver converts all JS numbers to float)
+    const fixedParams: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(params)) {
+      if (typeof value === 'number') {
+        fixedParams[key] = neo4j.int(Math.floor(value));
+      } else {
+        fixedParams[key] = value;
+      }
+    }
     return isWrite
-      ? this.writeQuery(cypher, params)
-      : this.readQuery(cypher, params);
+      ? this.writeQuery(cypher, fixedParams)
+      : this.readQuery(cypher, fixedParams);
+  }
+
+  /**
+   * Execute a safe, pre-defined query by template name.
+   * Only accepts templates from SAFE_CYPHER_TEMPLATES — prevents Cypher injection.
+   * Use this for MCP tools and external-facing query endpoints.
+   *
+   * @param templateName - Key in SAFE_CYPHER_TEMPLATES dictionary
+   * @param params - Parameterized query parameters
+   * @throws Error if templateName is not in the safe dictionary
+   */
+  async safeQuery(templateName: string, params: Record<string, unknown> = {}): Promise<Record<string, unknown>[]> {
+    const cypher = getSafeQuery(templateName);
+    // Ensure limit is an integer (JSON.parse converts to float in some JSON impls)
+    if (typeof params.limit === 'number') {
+      params.limit = neo4j.int(Math.floor(params.limit));
+    }
+    logger.info({ templateName, params: Object.keys(params) }, 'Executing safe query');
+    return this.readQuery(cypher, params);
   }
 
   // ==========================================

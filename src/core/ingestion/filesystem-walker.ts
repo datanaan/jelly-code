@@ -31,7 +31,7 @@ export interface FilePath {
 const READ_CONCURRENCY = 32;
 
 /** Skip files larger than 512KB — they're usually generated/vendored and crash tree-sitter */
-const MAX_FILE_SIZE = 512 * 1024;
+const MAX_FILE_SIZE = parseInt(process.env.MAX_FILE_SIZE || (512 * 1024).toString(), 10);
 
 // ── Document whitelist (T6) ─────────────────────────────────────────
 /**

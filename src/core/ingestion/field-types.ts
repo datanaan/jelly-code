@@ -1,4 +1,4 @@
-// field-types.ts
+// src/core/ingestion/field-types.ts
 
 import type { TypeEnvironment } from './type-env.js';
 import type { SymbolTable } from './symbol-table.js';

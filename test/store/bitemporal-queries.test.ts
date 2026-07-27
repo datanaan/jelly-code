@@ -400,3 +400,102 @@ describe('backward compatibility', () => {
     expect(cypher).toContain('coalesce(r.valid_to');
   });
 });
+
+// ─── closeCrossDomainEdgesForNode (v1.3.0 Phase 1 T1-6) ────────────
+
+describe('closeCrossDomainEdgesForNode (v1.3.0 T1-6)', () => {
+  it('CK-6: closes active DESCRIBES + DOCUMENTED_BY edges with valid_to + txn_to', async () => {
+    const store = createMockGraphStore([
+      { closedDescribes: 2, closedDocumentedBy: 2 },
+    ]);
+    const queries = createBitemporalQueries(store);
+
+    const result = await queries.closeCrossDomainEdgesForNode(
+      'proj-1',
+      'old-codenode-1',
+      '2026-07-22T10:00:00Z',
+      '2026-07-22T10:01:00Z',
+    );
+
+    expect(result).toBe(4); // 2 DESCRIBES + 2 DOCUMENTED_BY
+
+    const [cypher, params] = vi.mocked(store.query).mock.calls[0];
+
+    // Both edge types are handled
+    expect(cypher).toContain(':DESCRIBES');
+    expect(cypher).toContain(':DOCUMENTED_BY');
+
+    // Bi-temporal closing: valid_to + txn_to SET
+    expect(cypher).toContain('d.valid_to = $supersedeTime');
+    expect(cypher).toContain('d.txn_to = $txnTime');
+    expect(cypher).toContain('db.valid_to = $supersedeTime');
+    expect(cypher).toContain('db.txn_to = $txnTime');
+
+    // Only closes currently-active edges
+    expect(cypher).toContain('d.valid_to IS NULL');
+    expect(cypher).toContain('db.valid_to IS NULL');
+
+    // projectId isolation
+    expect(cypher).toContain('$projectId');
+    expect(params).toHaveProperty('projectId', 'proj-1');
+    expect(params).toHaveProperty('nodeId', 'old-codenode-1');
+    expect(params).toHaveProperty('supersedeTime', '2026-07-22T10:00:00Z');
+    expect(params).toHaveProperty('txnTime', '2026-07-22T10:01:00Z');
+  });
+
+  it('returns 0 when no active cross-domain edges exist', async () => {
+    const store = createMockGraphStore([
+      { closedDescribes: 0, closedDocumentedBy: 0 },
+    ]);
+    const queries = createBitemporalQueries(store);
+
+    const result = await queries.closeCrossDomainEdgesForNode(
+      'proj-1', 'node-without-edges',
+    );
+
+    expect(result).toBe(0);
+  });
+
+  it('returns 0 when Neo4j returns empty result set', async () => {
+    const store = createMockGraphStore([]);
+    const queries = createBitemporalQueries(store);
+
+    const result = await queries.closeCrossDomainEdgesForNode(
+      'proj-1', 'nonexistent-node',
+    );
+
+    expect(result).toBe(0);
+  });
+
+  it('uses default timestamps when supersedeTime/txnTime omitted', async () => {
+    const store = createMockGraphStore([
+      { closedDescribes: 1, closedDocumentedBy: 1 },
+    ]);
+    const queries = createBitemporalQueries(store);
+
+    await queries.closeCrossDomainEdgesForNode('proj-1', 'node-1');
+
+    const [, params] = vi.mocked(store.query).mock.calls[0];
+    // Should have ISO timestamps (generated from new Date().toISOString())
+    expect(params.supersedeTime).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    expect(params.txnTime).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  });
+
+  it('CK-6: is idempotent — only closes edges where valid_to IS NULL', async () => {
+    const store = createMockGraphStore([
+      { closedDescribes: 0, closedDocumentedBy: 0 },
+    ]);
+    const queries = createBitemporalQueries(store);
+
+    // First call closes edges; second call finds no active edges
+    await queries.closeCrossDomainEdgesForNode('proj-1', 'node-1');
+    const secondResult = await queries.closeCrossDomainEdgesForNode('proj-1', 'node-1');
+
+    // The WHERE d.valid_to IS NULL clause ensures already-closed edges aren't touched
+    expect(secondResult).toBe(0);
+
+    const [cypher] = vi.mocked(store.query).mock.calls[1];
+    expect(cypher).toContain('d.valid_to IS NULL');
+    expect(cypher).toContain('db.valid_to IS NULL');
+  });
+});

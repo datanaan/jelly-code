@@ -1,4 +1,4 @@
-// field-extractors/configs/python.ts
+// src/core/ingestion/field-extractors/configs/python.ts
 
 import { SupportedLanguages } from '@shared';
 import type { FieldExtractionConfig } from '../generic.js';

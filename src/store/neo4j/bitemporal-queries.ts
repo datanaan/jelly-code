@@ -79,6 +79,67 @@ export interface BitemporalQueries {
     newRelation: BiTemporalRelation & { sourceId: string; targetId: string; type: string },
     txnTime?: string,
   ): Promise<SupersedeResult>;
+
+  /**
+   * v1.3.0 Phase 1 T1-6: Close all active cross-domain edges
+   * (DESCRIBES + DOCUMENTED_BY) incident to a CodeNode that is being
+   * superseded during incremental analysis.
+   *
+   * Sets valid_to + txn_to on currently-active (valid_to IS NULL) edges,
+   * preserving bi-temporal history of which WikiEntity documented which
+   * CodeNode and when that documentation link ended.
+   *
+   * Call this BEFORE deleting/replacing a CodeNode so the edge history
+   * is preserved (DETACH DELETE would hard-delete edges, losing history).
+   *
+   * @returns count of closed DESCRIBES + DOCUMENTED_BY edges
+   */
+  closeCrossDomainEdgesForNode(
+    projectId: string,
+    nodeId: string,
+    supersedeTime?: string,
+    txnTime?: string,
+  ): Promise<number>;
+
+  /**
+   * v1.3.0 Phase 2 T2-1: Find all relation changes in a project within a
+   * valid_time range — project-level (no specific nodeId required).
+   *
+   * v1.3.0 self-audit fix: Added optional nodeId parameter so node-scoped
+   * queries also benefit from cross-domain edge support (DESCRIBES/
+   * DOCUMENTED_BY). Previously, node-scoped queries used findChangesBetween
+   * which only matched CODE_RELATION edges.
+   *
+   * Queries ALL relationships: CODE_RELATION, DESCRIBES,
+   * DOCUMENTED_BY, etc. — anything with valid_from in the time window.
+   *
+   * Returns structured change records with source/target node details,
+   * suitable for the `changes_between` MCP tool response.
+   */
+  projectChangesBetween(
+    projectId: string,
+    fromTime: string,
+    toTime: string,
+    options?: {
+      nodeId?: string;
+      relationTypes?: string[];
+      activeOnly?: boolean;
+      limit?: number;
+    },
+  ): Promise<ProjectChangeRecord[]>;
+}
+
+/**
+ * v1.3.0 Phase 2 T2-1: A single change record in projectChangesBetween.
+ * Captures both node endpoints and the relation's bi-temporal metadata.
+ */
+export interface ProjectChangeRecord {
+  sourceNode: { id: string; name: string; type: string };
+  targetNode: { id: string; name: string; type: string };
+  relationType: string;
+  valid_from: string;
+  valid_to: string | null;
+  commitId?: string;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────
@@ -336,6 +397,120 @@ export function createBitemporalQueries(graphStore: IGraphStore): BitemporalQuer
 
       const closed = results.length > 0 ? toNumber(results[0].closed) : 0;
       return { superseded: closed > 0 };
+    },
+
+    // ================================================================
+    // closeCrossDomainEdgesForNode (v1.3.0 Phase 1 T1-6)
+    // ================================================================
+    async closeCrossDomainEdgesForNode(
+      projectId: string,
+      nodeId: string,
+      supersedeTime: string = new Date().toISOString(),
+      txnTime: string = new Date().toISOString(),
+    ): Promise<number> {
+      // Close active DESCRIBES edges: (WikiEntity)-[:DESCRIBES]->(node)
+      // Close active DOCUMENTED_BY edges: (node)-[:DOCUMENTED_BY]->(WikiEntity)
+      //
+      // Both edge types are closed in a single query for atomicity.
+      // valid_to/txn_to are only set on currently-active edges (valid_to IS NULL),
+      // so re-calling this method is a no-op (idempotent).
+      const results = await graphStore.query(
+        `MATCH (e:WikiEntity)-[d:DESCRIBES {projectId: $projectId}]->(n {id: $nodeId, projectId: $projectId})
+         WHERE d.valid_to IS NULL
+         SET d.valid_to = $supersedeTime, d.txn_to = $txnTime
+         WITH e, count(d) AS closedDescribes
+         MATCH (n2 {id: $nodeId, projectId: $projectId})-[db:DOCUMENTED_BY {projectId: $projectId}]->(e)
+         WHERE db.valid_to IS NULL
+         SET db.valid_to = $supersedeTime, db.txn_to = $txnTime
+         RETURN closedDescribes, count(db) AS closedDocumentedBy`,
+        { projectId, nodeId, supersedeTime, txnTime },
+      );
+
+      if (results.length === 0) return 0;
+      const r = results[0];
+      const closedDescribes = toNumber(r.closedDescribes);
+      const closedDocumentedBy = toNumber(r.closedDocumentedBy);
+      return closedDescribes + closedDocumentedBy;
+    },
+
+    // ================================================================
+    // projectChangesBetween (v1.3.0 Phase 2 T2-1)
+    // ================================================================
+    async projectChangesBetween(
+      projectId: string,
+      fromTime: string,
+      toTime: string,
+      options?: {
+        nodeId?: string;
+        relationTypes?: string[];
+        activeOnly?: boolean;
+        limit?: number;
+      },
+    ): Promise<ProjectChangeRecord[]> {
+      // Query ALL relationship types in the project, not just CODE_RELATION.
+      // This includes CODE_RELATION, DESCRIBES, DOCUMENTED_BY, and any other
+      // typed edge that carries valid_from/valid_to bi-temporal metadata.
+      //
+      // v1.3.0 self-audit fix: When nodeId is provided, scope to that node
+      // (both outgoing and incoming edges) while still querying all edge types.
+      const nodeFilter = options?.nodeId
+        ? `AND (n.id = $nodeId OR m.id = $nodeId)`
+        : '';
+
+      const relTypeFilter = options?.relationTypes && options.relationTypes.length > 0
+        ? `AND type(r) IN $relationTypes`
+        : `AND (type(r) = 'CODE_RELATION' OR type(r) = 'DESCRIBES' OR type(r) = 'DOCUMENTED_BY')`;
+
+      const activeFilter = options?.activeOnly
+        ? `AND r.valid_to IS NULL`
+        : '';
+
+      const limitClause = options?.limit
+        ? `LIMIT ${options.limit}`
+        : '';
+
+      const results = await graphStore.query(
+        `MATCH (n {projectId: $projectId})-[r]->(m {projectId: $projectId})
+         WHERE coalesce(r.valid_from, '${EPOCH}') > $fromTime
+           AND coalesce(r.valid_from, '${EPOCH}') <= $toTime
+           ${nodeFilter}
+           ${relTypeFilter}
+           ${activeFilter}
+         RETURN n.id AS sourceId, n.name AS sourceName, n.type AS sourceType,
+                m.id AS targetId, m.name AS targetName, m.type AS targetType,
+                type(r) AS relationType,
+                coalesce(r.valid_from, '${EPOCH}') AS valid_from,
+                r.valid_to AS valid_to,
+                r.commitId AS commitId
+         ORDER BY valid_from DESC
+         ${limitClause}`,
+        {
+          projectId,
+          fromTime,
+          toTime,
+          ...(options?.nodeId ? { nodeId: options.nodeId } : {}),
+          ...(options?.relationTypes && options.relationTypes.length > 0
+            ? { relationTypes: options.relationTypes }
+            : {}),
+        },
+      );
+
+      return results.map(r => ({
+        sourceNode: {
+          id: r.sourceId as string,
+          name: (r.sourceName as string) ?? '',
+          type: (r.sourceType as string) ?? '',
+        },
+        targetNode: {
+          id: r.targetId as string,
+          name: (r.targetName as string) ?? '',
+          type: (r.targetType as string) ?? '',
+        },
+        relationType: r.relationType as string,
+        valid_from: r.valid_from as string,
+        valid_to: (r.valid_to as string | null) ?? null,
+        commitId: (r.commitId as string | undefined) ?? undefined,
+      }));
     },
   };
 }

@@ -26,6 +26,14 @@ export function createWikiRoutes(wikiService: WikiService): Router {
         return res.status(400).json({ error: 'source_path is required and must be a string' });
       }
       const taskId = wikiService.startIngest(projectId, source_path, typeof content === 'string' ? content : undefined);
+      if (taskId === null) {
+        return res.json({
+          status: 'already_running',
+          projectId,
+          sourcePath: source_path,
+          hint: 'Ingestion for this file is already in progress. Use GET /api/wiki/status to check progress.',
+        });
+      }
       res.json({
         status: 'processing',
         taskId,
@@ -57,6 +65,14 @@ export function createWikiRoutes(wikiService: WikiService): Router {
       } else if (dir && typeof dir === 'string') {
         // Filesystem-based batch ingest
         const taskId = wikiService.startBatchIngest(projectId, dir, pattern);
+        if (taskId === null) {
+          return res.json({
+            status: 'already_running',
+            projectId,
+            dir,
+            hint: 'Batch ingestion for this directory is already in progress. Use GET /api/wiki/status to check progress.',
+          });
+        }
         res.json({
           status: 'processing',
           taskId,
@@ -300,6 +316,14 @@ export function createWikiRoutes(wikiService: WikiService): Router {
       }
 
       const taskId = wikiService.startEvolutionStoryGeneration(projectId, nodeId);
+      if (taskId === null) {
+        return res.json({
+          status: 'already_running',
+          projectId,
+          nodeId,
+          hint: 'Evolution story generation for this symbol is already in progress. Use GET /api/wiki/status to check progress.',
+        });
+      }
       res.json({
         status: 'processing',
         taskId,

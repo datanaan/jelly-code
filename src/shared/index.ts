@@ -1,10 +1,3 @@
-/**
- * Shared types and utilities — single source of truth.
- *
- * Re-exports all common types used across the code analysis pipeline,
- * CLI, and MCP tools. Everything imported elsewhere comes from here.
- */
-
 // Graph types
 export type {
   NodeLabel,
@@ -13,6 +6,15 @@ export type {
   GraphNode,
   GraphRelationship,
 } from './graph/types.js';
+
+// Schema constants
+export {
+  NODE_TABLES,
+  REL_TABLE_NAME,
+  REL_TYPES,
+  EMBEDDING_TABLE_NAME,
+} from './lbug/schema-constants.js';
+export type { NodeTableName, RelType } from './lbug/schema-constants.js';
 
 // Language support
 export { SupportedLanguages } from './languages.js';

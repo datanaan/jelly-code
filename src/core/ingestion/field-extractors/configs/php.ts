@@ -1,4 +1,4 @@
-// field-extractors/configs/php.ts
+// src/core/ingestion/field-extractors/configs/php.ts
 
 import { SupportedLanguages } from '@shared';
 import type { FieldExtractionConfig } from '../generic.js';

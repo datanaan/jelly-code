@@ -1,4 +1,4 @@
-// field-extractors/configs/swift.ts
+// src/core/ingestion/field-extractors/configs/swift.ts
 
 import { SupportedLanguages } from '@shared';
 import type { FieldExtractionConfig } from '../generic.js';

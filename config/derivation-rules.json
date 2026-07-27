@@ -1,0 +1,29 @@
+{
+  "enabled": true,
+  "rules": [
+    {
+      "name": "exported_api",
+      "description": "Exported functions and classes",
+      "filter": { "has_exportModifier": true, "type": ["Function", "Class", "Interface"] },
+      "priority": 1,
+      "maxPerProject": 100
+    },
+    {
+      "name": "high_indegree",
+      "description": "Nodes with ≥5 inbound relations",
+      "filter": { "minInDegree": 5 },
+      "priority": 2,
+      "maxPerProject": 50
+    },
+    {
+      "name": "community_top",
+      "description": "High-degree nodes as community representatives (approximate — uses global degree ranking, not per-Leiden-community ranking)",
+      "filter": { "communityRank": 3 },
+      "priority": 3,
+      "maxPerProject": 30
+    }
+  ],
+  "maxEntitiesPerProject": 200,
+  "llmFallback": true,
+  "llmFallbackDefinition": "Exported {type} {name} in {filePath}. Signature: {signature}."
+}

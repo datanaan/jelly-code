@@ -21,8 +21,8 @@ const program = new Command();
 
 program
   .name('jelly-code')
-  .description('Code Knowledge Graph Cloud Service')
-  .version('0.1.0');
+  .description('MCP-native, multi-language code knowledge graph service')
+  .version('1.1.4');
 
 program
   .command('analyze <repoPath>')

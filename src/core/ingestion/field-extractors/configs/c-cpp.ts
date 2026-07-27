@@ -1,4 +1,4 @@
-// field-extractors/configs/c-cpp.ts
+// src/core/ingestion/field-extractors/configs/c-cpp.ts
 
 import { SupportedLanguages } from '@shared';
 import type { FieldExtractionConfig } from '../generic.js';

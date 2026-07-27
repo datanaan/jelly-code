@@ -1,7 +1,7 @@
 # Jelly Code 部署与配置报告
 
 > 部署日期: 2026-05-18  
-> 主机: 根据实际部署环境配置  
+> 主机: 127-UBU2404-CODE-CENTER (172.80.1.127)  
 > 磁盘: /dev/sdb1 59G (已用 3.7G / 7%)
 
 ---
@@ -148,7 +148,7 @@ curl -X POST http://localhost:8095/api/analyze \
 
 | 测试项 | 结果 |
 |--------|------|
-| `/health` | `{"status":"ok","mode":"standalone","version":"0.1.0"}` |
+| `/health` | `{"status":"ok","mode":"standalone","version":"1.3.1"}` |
 | `GET /api/projects` | `{"error":"API Key required"}` (认证正常) |
 | `GET /api/projects` (带 Key) | `{"projects":[]}` (Neo4j 连接正常) |
 | Neo4j Schema | `[server] Neo4j schema initialized` |

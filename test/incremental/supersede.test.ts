@@ -327,8 +327,8 @@ describe('P1-T3: Incremental supersede (soft delete + bi-temporal edges)', () =>
         throw new IncrementalFallbackError('Import resolution failed: Symbol X not found', 'X');
       })
       .mockResolvedValueOnce({
-        nodes: [],
-        relations: [],
+        nodes: [{ id: 'node-1', type: 'File', name: 'main.ts', filePath: 'src/main.ts' }],
+        relations: [{ sourceId: 'node-1', targetId: 'node-1', type: 'CONTAINS', confidence: 1.0 }],
         communities: [],
         processes: [],
         temporalCommits: [],

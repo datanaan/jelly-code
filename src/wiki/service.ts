@@ -21,7 +21,7 @@ import { WikiSearch } from './search.js';
 import type { StoreSet, IGraphStore } from '../store/interfaces.js';
 import type { ILLMClient } from '../llm/interface.js';
 import { COMPILE_PROMPT, MERGE_PROMPT, SYNTHESIZE_PROMPT } from '../llm/prompts.js';
-import { embedText, embeddingToArray } from '../core/embeddings/embedder.js';
+import { embedText, embeddingToArray, isEmbedderReady, initEmbedder } from '../core/embeddings/embedder.js';
 import { discoverDocs } from './doc-discovery.js';
 import { generateSignature, type CodeSignature } from './code-signature.js';
 import { checkEntityFreshness } from './entity-freshness.js';
@@ -40,6 +40,7 @@ import type {
   WikiStatus,
   WikiIndex,
   LintIssue,
+  EntityType,
 } from './models.js';
 
 /** Re-export LintIssue for backward compatibility (moved to models.ts in P0c-T2) */
@@ -49,6 +50,14 @@ export type { LintIssue } from './models.js';
 export interface WikiConfig {
   staleDays: number;
   autoWriteBack: boolean;
+  /** P2-T8: Max LLM calls per batch (cost control). 0 = unlimited. Default: 50 */
+  maxLlmCallsPerBatch: number;
+  /** P2-T8: Max tokens per LLM call. 0 = unlimited. Default: 4096 */
+  maxTokensPerCall: number;
+  /** P2-T8: Skip evolution stories for nodes with changedInCount below this threshold. Default: 10 */
+  importanceThreshold: number;
+  /** P2-T8: Skip evolution stories for nodes with evolvedFromDepth below this threshold. Default: 2 */
+  evolutionDepthThreshold: number;
 }
 
 export interface WikiTaskInfo {
@@ -67,6 +76,10 @@ export class WikiService {
   private llm: ILLMClient;
   private config: WikiConfig;
   private activeTasks = new Map<string, WikiTaskInfo>();
+  /** Processing key set for concurrent-control: prevents duplicate fire-and-forget tasks */
+  private processingKeys = new Set<string>();
+  /** Hard cap on activeTasks to prevent OOM (P0 idempotency fix) */
+  private maxActiveTasks = 1000;
   /**
    * Direct reference to the underlying IGraphStore for code node lookups
    * (codeSignature binding in P0c-T3). WikiGraph wraps IGraphStore but only
@@ -80,6 +93,107 @@ export class WikiService {
     this.llm = stores.llm;
     this.config = wikiConfig;
     this.codeStore = stores.graph;
+
+    // Periodic cleanup of completed/errored tasks (every 5 minutes)
+    setInterval(() => this.cleanupOldTasks(), 5 * 60 * 1000);
+  }
+
+  /**
+   * Remove tasks that have been in 'done' or 'error' state for more than 1 hour.
+   * Prevents activeTasks Map from growing unboundedly (P0 idempotency fix).
+   *
+   * Collects keys first to avoid mutation-during-iteration confusion,
+   * even though Map.delete() during for...of is safe per ECMAScript spec.
+   */
+  private cleanupOldTasks(): void {
+    const cutoff = Date.now() - 60 * 60 * 1000;
+    const toDelete: string[] = [];
+    for (const [id, task] of this.activeTasks) {
+      if (task.status === 'done' || task.status === 'error') {
+        const completedAt = task.completedAt ? new Date(task.completedAt).getTime() : 0;
+        if (completedAt > 0 && completedAt < cutoff) {
+          toDelete.push(id);
+        }
+      }
+    }
+    for (const id of toDelete) {
+      this.activeTasks.delete(id);
+    }
+  }
+
+  /**
+   * Track a new task in activeTasks, enforcing the hard cap.
+   * Evicts the oldest completed/errored task when the map exceeds maxActiveTasks.
+   */
+  private trackTask(taskId: string, task: WikiTaskInfo): void {
+    if (this.activeTasks.size >= this.maxActiveTasks) {
+      // Find the oldest completed/errored task and evict it
+      let oldestId: string | null = null;
+      let oldestTime = Infinity;
+      for (const [id, t] of this.activeTasks) {
+        if (t.status === 'done' || t.status === 'error') {
+          const ts = t.completedAt ? new Date(t.completedAt).getTime() : 0;
+          if (ts < oldestTime) {
+            oldestTime = ts;
+            oldestId = id;
+          }
+        }
+      }
+      if (oldestId) this.activeTasks.delete(oldestId);
+    }
+    this.activeTasks.set(taskId, task);
+  }
+
+  /**
+   * Acquire a processing key for concurrent-control.
+   * Returns true if the key was acquired (not already processing).
+   */
+  private tryAcquireProcessing(key: string): boolean {
+    if (this.processingKeys.has(key)) return false;
+    this.processingKeys.add(key);
+    return true;
+  }
+
+  /**
+   * Release a processing key (always called in finally block).
+   */
+  private releaseProcessing(key: string): void {
+    this.processingKeys.delete(key);
+  }
+
+  /**
+   * v1.3.0 Phase 2: Expose WikiGraph for tools that need direct graph access
+   * (e.g., wiki_auto_fix querying cross-domain edges, deleting orphaned entities).
+   */
+  getGraph(): WikiGraph {
+    return this.graph;
+  }
+
+  /**
+   * v1.3.0 Phase 3 T3-3: Public wrapper for indexEntityPage.
+   * Allows WikiDerivationEngine to write search index via WikiService
+   * (D9 fix — not direct TS/Qdrant manipulation).
+   */
+  async indexEntity(
+    projectId: string,
+    entityId: string,
+    name: string,
+    details: string,
+    compiledAt: string,
+  ): Promise<void> {
+    await this.indexEntityPage(projectId, entityId, name, details, compiledAt);
+  }
+
+  /**
+   * v1.3.0 review fix (P0-1): Delete a WikiEntity from the search index.
+   * Symmetric counterpart to indexEntity — called when entities are deleted
+   * from Neo4j (e.g., wiki_auto_fix delete-orphaned, undo-auto-derived).
+   *
+   * Without this, Typesense/Qdrant retain stale documents that point to
+   * deleted Neo4j entities, causing agents to find non-existent wiki pages.
+   */
+  async deleteEntityFromIndex(entityId: string): Promise<void> {
+    await this.search.deletePage(entityId, 'entity');
   }
 
   /**
@@ -98,8 +212,16 @@ export class WikiService {
   /**
    * Fire-and-forget ingest — returns a task ID immediately.
    * The actual ingest runs via setImmediate in the background.
+   * Concurrent-control: same projectId+sourcePath is blocked while a task is in-flight.
+   *
+   * @returns taskId string on success, or **null** if a task for the same
+   *          (projectId, sourcePath) is already in progress. Callers must
+   *          handle null — typically by returning status="already_running".
    */
-  startIngest(projectId: string, sourcePath: string, content?: string): string {
+  startIngest(projectId: string, sourcePath: string, content?: string): string | null {
+    const processingKey = `${projectId}:ingest:${sourcePath}`;
+    if (!this.tryAcquireProcessing(processingKey)) return null;
+
     const taskId = `ingest-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const task: WikiTaskInfo = {
       projectId,
@@ -107,7 +229,7 @@ export class WikiService {
       status: 'compiling',
       startedAt: new Date().toISOString(),
     };
-    this.activeTasks.set(taskId, task);
+    this.trackTask(taskId, task);
 
     setImmediate(async () => {
       try {
@@ -119,6 +241,8 @@ export class WikiService {
         task.status = 'error';
         task.error = err instanceof Error ? err.message : String(err);
         task.completedAt = new Date().toISOString();
+      } finally {
+        this.releaseProcessing(processingKey);
       }
     });
 
@@ -127,8 +251,15 @@ export class WikiService {
 
   /**
    * Fire-and-forget batch content ingest — returns a task ID immediately.
+   * Concurrent-control: same projectId is blocked while a task is in-flight.
+   *
+   * @returns taskId string on success, or **null** if a batch for this
+   *          projectId is already in progress. Callers must handle null.
    */
-  startBatchIngestContent(projectId: string, files: Array<{ source_path: string; content: string }>): string {
+  startBatchIngestContent(projectId: string, files: Array<{ source_path: string; content: string }>): string | null {
+    const processingKey = `${projectId}:batch-content`;
+    if (!this.tryAcquireProcessing(processingKey)) return null;
+
     const taskId = `batch-content-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const task: WikiTaskInfo = {
       projectId,
@@ -136,7 +267,7 @@ export class WikiService {
       status: 'compiling',
       startedAt: new Date().toISOString(),
     };
-    this.activeTasks.set(taskId, task);
+    this.trackTask(taskId, task);
 
     setImmediate(async () => {
       try {
@@ -148,6 +279,8 @@ export class WikiService {
         task.status = 'error';
         task.error = err instanceof Error ? err.message : String(err);
         task.completedAt = new Date().toISOString();
+      } finally {
+        this.releaseProcessing(processingKey);
       }
     });
 
@@ -157,7 +290,10 @@ export class WikiService {
   /**
    * Fire-and-forget batch ingest — returns a task ID immediately.
    */
-  startBatchIngest(projectId: string, dir: string, pattern?: string): string {
+  startBatchIngest(projectId: string, dir: string, pattern?: string): string | null {
+    const processingKey = `${projectId}:batch:${dir}`;
+    if (!this.tryAcquireProcessing(processingKey)) return null;
+
     const taskId = `batch-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const task: WikiTaskInfo = {
       projectId,
@@ -165,7 +301,7 @@ export class WikiService {
       status: 'compiling',
       startedAt: new Date().toISOString(),
     };
-    this.activeTasks.set(taskId, task);
+    this.trackTask(taskId, task);
 
     setImmediate(async () => {
       try {
@@ -177,6 +313,8 @@ export class WikiService {
         task.status = 'error';
         task.error = err instanceof Error ? err.message : String(err);
         task.completedAt = new Date().toISOString();
+      } finally {
+        this.releaseProcessing(processingKey);
       }
     });
 
@@ -291,9 +429,13 @@ export class WikiService {
    *
    * @param projectId - Project identifier for multi-tenant isolation
    * @param repoPath - Absolute path to the repository root
-   * @returns taskId for tracking progress via getActiveTasks()
+   * @returns taskId string on success, or **null** if auto-discovery for
+   *          this repository is already in progress. Callers must handle null.
    */
-  startAutoDiscover(projectId: string, repoPath: string): string {
+  startAutoDiscover(projectId: string, repoPath: string): string | null {
+    const processingKey = `${projectId}:discover:${repoPath}`;
+    if (!this.tryAcquireProcessing(processingKey)) return null;
+
     const taskId = `auto-discover-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const task: WikiTaskInfo = {
       projectId,
@@ -301,7 +443,7 @@ export class WikiService {
       status: 'compiling',
       startedAt: new Date().toISOString(),
     };
-    this.activeTasks.set(taskId, task);
+    this.trackTask(taskId, task);
 
     setImmediate(async () => {
       try {
@@ -314,6 +456,8 @@ export class WikiService {
         task.status = 'error';
         task.error = err instanceof Error ? err.message : String(err);
         task.completedAt = new Date().toISOString();
+      } finally {
+        this.releaseProcessing(processingKey);
       }
     });
 
@@ -327,12 +471,36 @@ export class WikiService {
   /**
    * Ingest a single source file.
    *
-   * Flow: read file (or use provided content) -> get existing entities -> LLM compile ->
-   *       create/update Source+Entities -> build relations -> log
+   * Flow: read file (or use provided content) -> check content hash (skip LLM if unchanged) ->
+   *       get existing entities -> LLM compile -> create/update Source+Entities ->
+   *       build relations -> log
    */
   async ingest(projectId: string, sourcePath: string, content?: string): Promise<IngestResult> {
     const absPath = resolve(sourcePath);
     const fileContent = content ?? await readFile(absPath, 'utf-8');
+
+    // Compute content hash for idempotency check
+    const contentHash = createHash('sha256').update(fileContent).digest('hex');
+    const sourceId = this.sourceIdFromPath(absPath);
+
+    // Check if the same content was already compiled (skip LLM if unchanged)
+    const existingSource = await this.graph.query(
+      'MATCH (s:WikiSource {id: $id, projectId: $pid}) RETURN s.content_hash AS hash, s.llm_output_hash AS llmHash',
+      { id: sourceId, pid: projectId },
+    );
+    if (existingSource.length > 0) {
+      const storedHash = (existingSource[0] as Record<string, unknown>).hash as string | undefined;
+      if (storedHash === contentHash) {
+        // Content unchanged — skip LLM entirely
+        return {
+          source: { id: sourceId, projectId, title: '', sourcePath: absPath, summary: '', keyPoints: [], compiledAt: '' },
+          entitiesCreated: 0,
+          entitiesUpdated: 0,
+          contradictions: 0,
+          skipped: true,
+        };
+      }
+    }
 
     // Get existing entity names for dedup (scoped by projectId)
     const existingEntities = await this.graph.listEntities(projectId);
@@ -353,7 +521,40 @@ export class WikiService {
     };
 
     const now = new Date().toISOString();
-    const sourceId = this.sourceIdFromPath(absPath);
+
+    // Compute a structural fingerprint of LLM output for idempotent write check (P2).
+    // Uses a subset of semantically meaningful fields rather than full-text hash,
+    // because LLM output "jitter" (e.g. whitespace, rephrasing) produces different
+    // hashes for functionally identical outputs.
+    const outputFingerprint = JSON.stringify({
+      title: compileOutput.title,
+      summary: compileOutput.summary,
+      keyPoints: compileOutput.keyPoints,
+      entities: compileOutput.entities.map(e => ({
+        name: e.name,
+        type: e.type,
+        definition: e.definition,
+      })),
+      existingUpdates: compileOutput.existingUpdates.map(e => ({
+        entityName: e.entityName,
+        newInfo: e.newInfo,
+      })),
+    });
+    const llmOutputHash = createHash('sha256').update(outputFingerprint).digest('hex');
+
+    // Check if LLM output is unchanged — skip writes if nothing changed
+    const existingLlmHash = existingSource.length > 0
+      ? (existingSource[0] as Record<string, unknown>).llmHash as string | undefined
+      : undefined;
+    if (existingLlmHash === llmOutputHash) {
+      return {
+        source: { id: sourceId, projectId, title: '', sourcePath: absPath, summary: '', keyPoints: [], compiledAt: '' },
+        entitiesCreated: 0,
+        entitiesUpdated: 0,
+        contradictions: 0,
+        skipped: true,
+      };
+    }
 
     // Create or update Source (scoped by projectId)
     const source: WikiSource = {
@@ -364,6 +565,8 @@ export class WikiService {
       summary: compileOutput.summary,
       keyPoints: compileOutput.keyPoints,
       compiledAt: now,
+      contentHash,
+      llmOutputHash,
     };
     await this.graph.createSource(source);
 
@@ -399,6 +602,9 @@ export class WikiService {
         }
       } else {
         // Create new entity (scoped by projectId)
+        // P0c-T3: Bind codeSignature from describes links (null if unbound)
+        // v1.3.0 Phase 1 T1-3: Also capture codeNodeId for cross-domain edges
+        const binding = await this.bindCodeSignature(projectId, extracted.links ?? []);
         const entity: WikiEntity = {
           id: entityId,
           projectId,
@@ -408,10 +614,25 @@ export class WikiService {
           details: extracted.details ?? '',
           firstCompiled: now,
           lastUpdated: now,
-          // P0c-T3: Bind codeSignature from describes links (null if unbound)
-          codeSignature: await this.bindCodeSignature(projectId, extracted.links ?? []),
+          codeSignature: binding?.signature ?? null,
+          // v1.3.0 Phase 1 T1-5: mark provenance for ingest/batchIngest path.
+          // Future auto-derive (Phase 3) will set provenance='auto-derived'.
+          provenance: 'manual',
         };
         await this.graph.createEntity(entity);
+
+        // v1.3.0 Phase 1 T1-3: Write cross-domain edges (DESCRIBES + DOCUMENTED_BY)
+        // Supplement to codeSignature property — enables O(1) graph traversal
+        // and bi-temporal tracking of wiki↔code relationships.
+        if (binding) {
+          try {
+            await this.graph.createCrossDomainEdges(
+              projectId, entityId, binding.codeNodeId,
+            );
+          } catch {
+            // Cross-domain edge write failed — non-fatal, property binding still works
+          }
+        }
 
         // Index in search
         await this.indexEntityPage(projectId, entityId, extracted.name, extracted.details ?? '', now);
@@ -569,26 +790,40 @@ export class WikiService {
     const prompt = SYNTHESIZE_PROMPT(question, contextPages);
     const answer = await this.llm.generate(prompt);
 
-    // Optional write-back as Topic
+    // Optional write-back as Topic (de-duplicated by projectId + question)
     const shouldWriteBack = writeBack ?? this.config.autoWriteBack;
     if (shouldWriteBack && answer.trim()) {
-      const topicId = `topic-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const now = new Date().toISOString();
 
-      const topic: WikiTopic = {
-        id: topicId,
-        projectId,
-        title: question,
-        content: answer,
-        compiledAt: now,
-      };
-      await this.graph.createTopic(topic);
+      // Check if a Topic with the same projectId + title already exists
+      const existing = await this.graph.query(
+        'MATCH (t:WikiTopic {projectId: $pid, title: $q}) RETURN t.id AS id',
+        { pid: projectId, q: question },
+      );
 
-      // Index topic in search
-      await this.indexTopicPage(projectId, topicId, question, answer, now);
-
-      // Log
-      await this.logAction(projectId, 'query', `Queried: ${question}`, `Topic written: ${topicId}`, 1);
+      if (existing.length > 0) {
+        // Update existing Topic content
+        const existingId = (existing[0] as Record<string, unknown>).id as string;
+        await this.graph.query(
+          'MATCH (t:WikiTopic {id: $id}) SET t.content = $content, t.compiled_at = $now',
+          { id: existingId, content: answer, now },
+        );
+        await this.indexTopicPage(projectId, existingId, question, answer, now);
+        await this.logAction(projectId, 'query', `Queried: ${question}`, `Topic updated: ${existingId}`, 1);
+      } else {
+        // Create new Topic
+        const topicId = `topic-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const topic: WikiTopic = {
+          id: topicId,
+          projectId,
+          title: question,
+          content: answer,
+          compiledAt: now,
+        };
+        await this.graph.createTopic(topic);
+        await this.indexTopicPage(projectId, topicId, question, answer, now);
+        await this.logAction(projectId, 'query', `Queried: ${question}`, `Topic written: ${topicId}`, 1);
+      }
     } else {
       await this.logAction(projectId, 'query', `Queried: ${question}`, 'Answer generated (no write-back)', 0);
     }
@@ -664,8 +899,8 @@ export class WikiService {
   /**
    * List all entities, optionally filtered by type.
    */
-  async listEntities(projectId: string, type?: string): Promise<WikiEntity[]> {
-    return this.graph.listEntities(projectId, type as any);
+  async listEntities(projectId: string, type?: EntityType): Promise<WikiEntity[]> {
+    return this.graph.listEntities(projectId, type);
   }
 
   /**
@@ -1085,9 +1320,13 @@ export class WikiService {
    *
    * @param projectId - Project scope for isolation
    * @param nodeId - The code symbol to generate an evolution story for
-   * @returns taskId for tracking progress via getActiveTasks()
+   * @returns taskId string on success, or **null** if generation for this
+   *          symbol is already in progress. Callers must handle null.
    */
-  startEvolutionStoryGeneration(projectId: string, nodeId: string): string {
+  startEvolutionStoryGeneration(projectId: string, nodeId: string): string | null {
+    const processingKey = `${projectId}:evo:${nodeId}`;
+    if (!this.tryAcquireProcessing(processingKey)) return null;
+
     const taskId = `evo-story-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const task: WikiTaskInfo = {
       projectId,
@@ -1095,7 +1334,7 @@ export class WikiService {
       status: 'compiling',
       startedAt: new Date().toISOString(),
     };
-    this.activeTasks.set(taskId, task);
+    this.trackTask(taskId, task);
 
     setImmediate(async () => {
       try {
@@ -1107,6 +1346,8 @@ export class WikiService {
         task.status = 'error';
         task.error = err instanceof Error ? err.message : String(err);
         task.completedAt = new Date().toISOString();
+      } finally {
+        this.releaseProcessing(processingKey);
       }
     });
 
@@ -1133,6 +1374,11 @@ export class WikiService {
   async generateAllEvolutionStories(
     projectId: string,
   ): Promise<{ generated: number; skipped: number; errors: string[] }> {
+    // P2-T8: Cost control — use config thresholds
+    const maxCalls = this.config.maxLlmCallsPerBatch > 0 ? this.config.maxLlmCallsPerBatch : Infinity;
+    const importanceThreshold = this.config.importanceThreshold;
+    const evolutionDepthThreshold = this.config.evolutionDepthThreshold;
+
     // Step 1: List all CodeNodes for this project
     const nodeRows = await this.codeStore.query(
       `MATCH (n {projectId: $projectId}) RETURN n.id AS nodeId, n.name AS name`,
@@ -1149,6 +1395,12 @@ export class WikiService {
     const errors: string[] = [];
 
     for (const node of nodes) {
+      // P2-T8: Cost control gate — stop if we've hit the LLM call budget
+      if (generated >= maxCalls) {
+        skipped += nodes.length - (generated + skipped + errors.length);
+        break;
+      }
+
       try {
         // Step 2: Check importance via lightweight count queries
         // (avoid double-calling gatherEvolutionFacts, which generateEvolutionStory will call internally)
@@ -1178,8 +1430,8 @@ export class WikiService {
           if (!currentId) break;
         }
 
-        // Step 3: Check importance criteria
-        const isImportant = changedInCount > 10 || evolvedFromDepth > 2;
+        // Step 3: Check importance criteria (P2-T8: configurable thresholds)
+        const isImportant = changedInCount > importanceThreshold || evolvedFromDepth > evolutionDepthThreshold;
 
         if (!isImportant) {
           skipped++;
@@ -1216,23 +1468,27 @@ export class WikiService {
    * P0c-T3: Bind a CodeSignature to a wiki entity by looking up code nodes
    * referenced in "describes" links.
    *
+   * v1.3.0 Phase 1 T1-3: Also returns the matched codeNodeId so the caller
+   * can create DESCRIBES/DOCUMENTED_BY cross-domain edges after the entity
+   * is persisted.
+   *
    * For each link with relationship === 'describes':
    * 1. Extract the target symbol name (strip any "fn:"/"class:" prefix)
    * 2. Query the graph store (findSymbol) for the code node
    * 3. If found with `content`, generate a CodeSignature via generateSignature()
-   * 4. Return the first successful signature
+   * 4. Return the first successful signature + the codeNodeId
    *
    * If no describes link exists, or all lookups fail, returns `null` (explicit
    * unbound per P0c-T2 semantics: null = intentionally unbound, undefined = pre-P0c).
    *
    * @param projectId - Project scope for the code lookup
    * @param links - ExtractedEntity links array
-   * @returns CodeSignature on success, null if unbound or lookup failed
+   * @returns `{ signature, codeNodeId }` on success, null if unbound or lookup failed
    */
   private async bindCodeSignature(
     projectId: string,
     links: Array<{ target: string; relationship: string }>,
-  ): Promise<CodeSignature | null> {
+  ): Promise<{ signature: CodeSignature; codeNodeId: string } | null> {
     const describesLinks = links.filter((l) => l.relationship === 'describes');
 
     // No describes link → explicitly unbound
@@ -1252,7 +1508,8 @@ export class WikiService {
         // Generate signature from the code node's source content
         // Use the code node's name if available (more precise than extracted name)
         try {
-          return generateSignature(codeNode.content, codeNode.name ?? symbolName);
+          const signature = generateSignature(codeNode.content, codeNode.name ?? symbolName);
+          return { signature, codeNodeId: codeNode.id };
         } catch {
           // generateSignature failed (e.g., unparseable source) — try next link
           continue;
@@ -1272,6 +1529,18 @@ export class WikiService {
    * Uses the existing embedding pipeline from core/embeddings.
    */
   private async generateEmbedding(text: string): Promise<number[]> {
+    // Auto-init embedder if not ready. This handles the case where
+    // Wiki indexing is the first consumer of embedding (no prior
+    // EmbeddingPipeline call that would have triggered initEmbedder).
+    if (!isEmbedderReady()) {
+      try {
+        await initEmbedder();
+      } catch {
+        // Non-fatal: if embedder fails to initialize (e.g. no ONNX binary),
+        // Wiki search degrades to keyword-only, core functionality unaffected.
+        return [];
+      }
+    }
     const vec = await embedText(text);
     return embeddingToArray(vec);
   }
@@ -1417,6 +1686,9 @@ export class WikiService {
   /**
    * Log a wiki action.
    */
+  /** Track log cleanup state per project to avoid redundant count queries */
+  private _logCleanupCounters = new Map<string, number>();
+
   private async logAction(
     projectId: string,
     action: WikiLogEntry['action'],
@@ -1434,6 +1706,35 @@ export class WikiService {
       createdAt: new Date().toISOString(),
     };
     await this.graph.appendLog(entry);
+
+    // Rate-limited cleanup: only check log count every 10 writes per project.
+    // The MATCH count(l) query is a full label scan on every log write, so
+    // throttling it avoids unnecessary Neo4j overhead on batch operations.
+    const counter = (this._logCleanupCounters.get(projectId) ?? 0) + 1;
+    this._logCleanupCounters.set(projectId, counter);
+    if (counter % 10 !== 0) return;
+
+    // Async cleanup: keep at most 500 log entries per project (P1 TTL)
+    setImmediate(async () => {
+      try {
+        const result = await this.graph.query(
+          'MATCH (l:WikiLogEntry {projectId: $pid}) RETURN count(l) AS cnt',
+          { pid: projectId },
+        );
+        const count = Number((result[0] as Record<string, unknown>)?.cnt ?? 0);
+        if (count > 500) {
+          const excess = count - 500;
+          await this.graph.query(
+            `MATCH (l:WikiLogEntry {projectId: $pid})
+             WITH l ORDER BY l.created_at ASC LIMIT $excess
+             DELETE l`,
+            { pid: projectId, excess },
+          );
+        }
+      } catch {
+        // Non-fatal: log cleanup failure should not affect the caller
+      }
+    });
   }
 
   /**

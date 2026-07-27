@@ -31,8 +31,11 @@ export function registerCodeEvolutionStory(
       description:
         "Trigger asynchronous generation of a code symbol's evolution " +
         "narrative — how it grew, split, merged, or was renamed over time. " +
-        "Returns a taskId immediately; poll wiki_status or the REST endpoint " +
-        "GET /api/wiki/evolution-story/:topicId to retrieve the finished story.",
+        "Returns status=\"compiling\" with a taskId on success, or " +
+        "status=\"already_running\" if generation for this symbol is already " +
+        "in progress (concurrency guard). " +
+        "Poll wiki_status or GET /api/wiki/evolution-story/:topicId " +
+        "to retrieve the finished story.",
       inputSchema: {
         projectId: z
           .string()
@@ -54,6 +57,28 @@ export function registerCodeEvolutionStory(
           projectId,
           nodeId,
         );
+
+        if (taskId === null) {
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text: JSON.stringify(
+                  {
+                    status: "already_running",
+                    message:
+                      "Evolution story generation for this symbol is already in progress. " +
+                      "Poll wiki_status or GET /api/wiki/evolution-story/:topicId to retrieve the result.",
+                    projectId,
+                    nodeId,
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        }
 
         return {
           content: [

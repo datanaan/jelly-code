@@ -28,7 +28,7 @@ export interface LLMOptions {
 }
 
 export interface LLMConfig {
-  baseUrl: string;     // LLM API base URL (e.g. http://localhost:11434 for Ollama)
+  baseUrl: string;     // e.g. http://localhost:11434
   model: string;       // e.g. qwen3:14b
   maxRetries: number;  // e.g. 3
   apiKey?: string;     // optional bearer token for OpenAI-compatible APIs

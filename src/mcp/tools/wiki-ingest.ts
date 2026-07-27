@@ -12,7 +12,7 @@ export function registerWikiIngest(server: McpServer, wikiService: WikiService):
   server.registerTool(
     'wiki_ingest',
     {
-      description: 'Ingest a single source file into the Wiki. Compiles the document into structured wiki entities using LLM. Use content parameter to send file body directly (no server filesystem access needed).',
+      description: 'Ingest a single source file into the Wiki. Compiles the document into structured wiki entities using LLM. Use content parameter to send file body directly (no server filesystem access needed). Returns status="processing" with a taskId on success, or status="already_running" if an ingestion for the same file is already in progress (concurrency guard).',
       inputSchema: {
         projectId: z.string().describe('Project ID to scope the wiki data to (multi-tenant isolation)'),
         source_path: z.string().describe('Path to the source file to ingest (used as identifier)'),
@@ -22,6 +22,21 @@ export function registerWikiIngest(server: McpServer, wikiService: WikiService):
     async ({ projectId, source_path, content }) => {
       try {
         const taskId = wikiService.startIngest(projectId, source_path, content);
+        if (taskId === null) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify({
+                  status: 'already_running',
+                  projectId,
+                  sourcePath: source_path,
+                  hint: 'Ingestion for this file is already in progress. Use wiki_status to check progress.',
+                }, null, 2),
+              },
+            ],
+          };
+        }
         return {
           content: [
             {

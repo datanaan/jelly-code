@@ -287,8 +287,29 @@ export class IncrementalScheduler {
     // =====================
     const result = await runIncrementalAnalyze(projectId, this.stores, this.repoCache, {
       precomputedChangeSet: changeSet,
+      // v1.3.0 Phase 3 T3-4b: pass wikiService for incremental auto-derivation
+      wikiService: this.wikiService,
     });
     console.log(`[scheduler] ${projectId}: incremental ${result.mode}, ${result.nodeCount} nodes`);
+
+    // v1.3.0 Phase 3 T3-6: Evolution story incremental trigger.
+    // Only triggers on successful incremental analysis with ≥10 changed files.
+    // Threshold avoids regenerating stories for small changes (2-3 files).
+    if (result.mode === 'incremental' && this.wikiService) {
+      const totalChanges = (result.changeSet?.modified ?? 0)
+        + (result.changeSet?.deleted ?? 0)
+        + (result.changeSet?.added ?? 0);
+      const threshold = parseInt(process.env.EVOLUTION_TRIGGER_THRESHOLD ?? '10', 10);
+      if (totalChanges >= threshold) {
+        try {
+          console.log(`[scheduler] ${projectId}: triggering evolution stories (${totalChanges} changed files ≥ ${threshold})`);
+          const evoResult = await this.wikiService.generateAllEvolutionStories(projectId);
+          console.log(`[scheduler] ${projectId}: evolution generated=${evoResult.generated}, skipped=${evoResult.skipped}`);
+        } catch (err) {
+          console.warn(`[scheduler] ${projectId}: evolution trigger failed (non-fatal): ${err instanceof Error ? err.message : err}`);
+        }
+      }
+    }
   }
 
   /** Force a full rebuild of a project. */
@@ -298,6 +319,8 @@ export class IncrementalScheduler {
     const stats = await runAnalyze('', projectId, this.stores, {
       gitUrl,
       repoCache: this.repoCache,
+      // v1.3.0 Phase 3 T3-4b: pass wikiService for auto-derivation
+      wikiService: this.wikiService,
     });
     await this.stores.graph.query(
       `MATCH (p:Project {id: $projectId})

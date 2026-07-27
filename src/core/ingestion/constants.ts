@@ -8,7 +8,7 @@ export const TREE_SITTER_BUFFER_SIZE = 512 * 1024;
  * Maximum buffer size cap (32 MB) to prevent OOM on huge files.
  * Also used as the file-size skip threshold — files larger than this are not parsed.
  */
-export const TREE_SITTER_MAX_BUFFER = 32 * 1024 * 1024;
+export const TREE_SITTER_MAX_BUFFER = parseInt(process.env.TREE_SITTER_MAX_BUFFER || (32 * 1024 * 1024).toString(), 10);
 
 /**
  * Compute adaptive buffer size for tree-sitter parsing.

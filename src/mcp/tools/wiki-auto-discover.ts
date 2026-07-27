@@ -22,7 +22,8 @@ export function registerWikiAutoDiscover(server: McpServer, wikiService: WikiSer
       description:
         'Auto-discover documentation files in a repository and start batch ingestion. ' +
         'Scans the repo, classifies documents, derives optimal glob pattern, and compiles them into wiki entities. ' +
-        'Returns a taskId for progress tracking via wiki_status.',
+        'Returns status="processing" with a taskId on success, or status="already_running" if auto-discovery ' +
+        'for this repository is already in progress (concurrency guard).',
       inputSchema: {
         projectId: z.string().describe('Project ID to scope the wiki data to (multi-tenant isolation)'),
         repoPath: z.string().describe('Absolute path to the repository root to scan for documents'),
@@ -31,6 +32,26 @@ export function registerWikiAutoDiscover(server: McpServer, wikiService: WikiSer
     async ({ projectId, repoPath }) => {
       try {
         const taskId = wikiService.startAutoDiscover(projectId, repoPath);
+        if (taskId === null) {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify(
+                  {
+                    status: 'already_running',
+                    mode: 'auto-discover',
+                    projectId,
+                    repoPath,
+                    hint: 'Auto-discovery for this repository is already in progress. Use wiki_status to check progress.',
+                  },
+                  null,
+                  2,
+                ),
+              },
+            ],
+          };
+        }
         return {
           content: [
             {

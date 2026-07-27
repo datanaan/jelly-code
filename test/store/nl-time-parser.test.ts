@@ -217,6 +217,47 @@ describe('nl-time-parser', () => {
   });
 
   // ================================================================
+  // v1.3.0 Phase 3 T3-5: "since <ISO date>" prefix support
+  // ================================================================
+  describe('date prefix (since/after/before ISO date) — v1.3.0 T3-5', () => {
+    it('parses "since 2026-07-01" as ISO date', () => {
+      expect(parseNaturalLanguageTime('since 2026-07-01', NOW)).toBe(
+        '2026-07-01T00:00:00Z',
+      );
+    });
+
+    it('parses "after 2026-06-15"', () => {
+      expect(parseNaturalLanguageTime('after 2026-06-15', NOW)).toBe(
+        '2026-06-15T00:00:00Z',
+      );
+    });
+
+    it('parses "before 2026-12-31"', () => {
+      expect(parseNaturalLanguageTime('before 2026-12-31', NOW)).toBe(
+        '2026-12-31T00:00:00Z',
+      );
+    });
+
+    it('parses "from 2026-01-01"', () => {
+      expect(parseNaturalLanguageTime('from 2026-01-01', NOW)).toBe(
+        '2026-01-01T00:00:00Z',
+      );
+    });
+
+    it('parses "since" with full ISO datetime', () => {
+      expect(parseNaturalLanguageTime('since 2026-07-01T08:00:00Z', NOW)).toBe(
+        '2026-07-01T08:00:00Z',
+      );
+    });
+
+    it('is case-insensitive for prefix', () => {
+      expect(parseNaturalLanguageTime('SINCE 2026-07-01', NOW)).toBe(
+        '2026-07-01T00:00:00Z',
+      );
+    });
+  });
+
+  // ================================================================
   // Error handling
   // ================================================================
   describe('error handling', () => {

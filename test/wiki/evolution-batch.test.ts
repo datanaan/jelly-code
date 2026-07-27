@@ -241,6 +241,10 @@ function createMockStoreSet(graph?: IGraphStore, llmResponse?: string): StoreSet
 const testWikiConfig: WikiConfig = {
   staleDays: 90,
   autoWriteBack: false,
+  maxLlmCallsPerBatch: 100,
+  maxTokensPerCall: 4096,
+  importanceThreshold: 10,
+  evolutionDepthThreshold: 2,
 };
 
 // ==========================================

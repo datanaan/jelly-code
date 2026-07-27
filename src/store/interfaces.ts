@@ -152,6 +152,9 @@ export interface IGraphStore {
   /** Execute raw Cypher query */
   query(cypher: string, params?: Record<string, unknown>): Promise<Record<string, unknown>[]>;
 
+  /** Execute a safe, pre-defined query by template name. Prevents Cypher injection. */
+  safeQuery?(templateName: string, params?: Record<string, unknown>): Promise<Record<string, unknown>[]>;
+
   /** Clear all data for a project */
   clearProject(projectId: string): Promise<void>;
 
@@ -193,6 +196,9 @@ export interface ISearchStore {
   /** Delete all documents for a given file path */
   deleteDocumentsByFilePath(projectId: string, filePath: string): Promise<number>;
 
+  /** Health check — returns true if the backend is reachable */
+  healthCheck?(): Promise<boolean>;
+
   /** Close connections */
   close(): Promise<void>;
 }
@@ -220,6 +226,9 @@ export interface IVectorStore {
 
   /** Delete vectors by node IDs */
   deleteVectorsByNodeIds(projectId: string, nodeIds: string[]): Promise<number>;
+
+  /** Health check — returns true if the backend is reachable */
+  healthCheck?(): Promise<boolean>;
 
   /** Close connections */
   close(): Promise<void>;

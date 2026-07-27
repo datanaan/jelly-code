@@ -10,13 +10,14 @@
  *
  * The ingestion pipeline is loaded dynamically at runtime because it's
  * excluded from TypeScript compilation (strict mode incompatibilities
- * from the ingestion pipeline). tsx handles the .ts files directly.
+ * from the jelly-code source). tsx handles the .ts files directly.
  */
 
-import { execSync } from 'child_process';
+import { execSync, execFile } from 'child_process';
 import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, dirname } from 'path';
+import * as path from 'path';
 import { fileURLToPath } from 'url';
 import type { StoreSet, CodeNode, Relation, SearchDocument } from '../store/interfaces.js';
 import { EPOCH } from '../store/bitemporal-model.js';
@@ -24,13 +25,14 @@ import type { PipelineResult } from '../types/pipeline.js';
 import { BM25Search } from './search/bm25-index.js';
 import { EmbeddingPipeline } from './embeddings/embedding-pipeline.js';
 import type { RepoCacheManager } from './repo-cache.js';
+import { logger } from './logger.js';
 
 // Searchable node types for Typesense indexing
 const SEARCHABLE_TYPES = new Set(['Function', 'Class', 'Method', 'Interface', 'File']);
 
 // Absolute path to the ingestion pipeline source (.ts), resolved from the compiled
 // dist/ output.  The pipeline is excluded from tsc (strict mode incompatibilities
-// ingestion pipeline is in .ts) so we must load the .ts file directly at runtime via tsx.
+// in jelly-code code) so we must load the .ts file directly at runtime via tsx.
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const PIPELINE_PATH = join(__dirname, '..', '..', 'src', 'core', 'ingestion', 'pipeline.ts');
 
@@ -92,7 +94,7 @@ function convertPipelineOutput(raw: RawPipelineOutput): PipelineResult {
  * Default pipeline runner that loads the ingestion pipeline at runtime.
  *
  * The ingestion module is excluded from tsc compilation due to strict mode
- * issues in the pipeline source code. We use Function() to prevent TypeScript
+ * issues in the jelly-code source code. We use Function() to prevent TypeScript
  * from statically analyzing the import path. At runtime, tsx resolves and
  * executes the .ts files directly.
  *
@@ -106,13 +108,30 @@ export const defaultPipelineRunner = async (
 ): Promise<PipelineResult> => {
   // Dynamic import via string to avoid TypeScript static analysis
   // (pipeline.ts is excluded from tsc compilation due to strict mode
-  // incompatibilities in pipeline source code)
-  const mod = await import(/* @vite-ignore */ PIPELINE_PATH);
-  const raw = await mod.runPipelineFromRepo(repoPath, (progress: { phase: string; percent: number; message: string }) => {
-    console.log(`[analyze] ${progress.phase}: ${progress.percent}% — ${progress.message}`);
-    if (onProgress) onProgress(progress.phase, progress.percent);
-  }, options) as RawPipelineOutput;
-  return convertPipelineOutput(raw);
+  // incompatibilities in jelly-code source code)
+  let mod: { runPipelineFromRepo: Function };
+  try {
+    mod = await import(/* @vite-ignore */ PIPELINE_PATH);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `PIPELINE_LOAD_FAILED: Cannot dynamically load pipeline at ${PIPELINE_PATH}. ` +
+      `This usually means tsx is not properly resolving the .ts file at runtime. ` +
+      `Error: ${msg}`
+    );
+  }
+  try {
+    const raw = await mod.runPipelineFromRepo(repoPath, (progress: { phase: string; percent: number; message: string }) => {
+      logger.info({ phase: progress.phase, percent: progress.percent, message: progress.message }, 'Pipeline progress');
+      if (onProgress) onProgress(progress.phase, progress.percent);
+    }, options) as RawPipelineOutput;
+    return convertPipelineOutput(raw);
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `PIPELINE_RUN_FAILED: Pipeline execution failed for ${repoPath}. Error: ${msg}`
+    );
+  }
 };
 
 export interface RunAnalyzeOptions {
@@ -130,6 +149,20 @@ export interface RunAnalyzeOptions {
   repoCache?: RepoCacheManager;
   /** Progress callback — called during analysis phases (e.g., "parsing", "indexing", "temporal") */
   onProgress?: (phase: string, percent: number) => void;
+  /**
+   * v1.3.0 Phase 3 T3-4 (D1 fix): WikiService for auto-derivation.
+   * When provided, auto-derive triggers after pipeline completion:
+   *   1. Load derivation rules (user file or default)
+   *   2. Select code nodes via CodeEntitySelector
+   *   3. Derive WikiEntity objects via WikiDerivationEngine
+   * When absent, auto-derive is skipped (graceful degradation).
+   */
+  wikiService?: import('../wiki/service.js').WikiService;
+  /** v1.4.0: dispatch derivation synchronously (legacy path, for tests).
+   * Default: false (async dispatch via JobDispatcher + llm-derivation queue). */
+  syncDerivation?: boolean;
+  /** v1.4.0: override LLM client (primarily for tests with mocked LLM). */
+  llmClient?: import('../llm/interface.js').ILLMClient;
 }
 
 export async function runAnalyze(
@@ -153,9 +186,10 @@ export async function runAnalyze(
   // If gitUrl provided, clone or use cached clone
   if (gitUrl) {
     // Validate gitUrl to prevent command injection via execSync
-    const GIT_URL_RE = /^(https?|git|ssh):\/\/[^\s"'`\\;|&$()]+$/;
+    // Strict validation: only https://, ssh://git@, git@ prefix
+    const GIT_URL_RE = /^((https?:\/\/|ssh:\/\/git@|git@)[\w.-]+[:/][\w./-]+\.git)$/;
     if (!GIT_URL_RE.test(gitUrl)) {
-      throw new Error(`Invalid gitUrl: contains disallowed characters (possible injection)`);
+      throw new Error(`Invalid gitUrl: does not match allowed format. Only https://, ssh://git@, and git@ URLs ending in .git are allowed.`);
     }
 
     if (repoCache) {
@@ -164,17 +198,31 @@ export async function runAnalyze(
       effectivePath = localPath;
     } else {
       // Legacy: temp directory clone
+      // Use execFile instead of execSync to avoid shell injection
       tempDir = mkdtempSync(join(tmpdir(), 'jelly-code-'));
-      console.log(`[analyze] Cloning ${gitUrl} → ${tempDir}`);
-      execSync(`git clone --depth 1 "${gitUrl}" "${tempDir}"`, {
-        stdio: 'pipe',
-        timeout: 300_000, // 5 min clone timeout
+      logger.info({ gitUrl, tempDir }, 'Cloning repository');
+      await new Promise<void>((resolve, reject) => {
+        execFile('git', ['clone', '--depth', '1', gitUrl as string, tempDir as string], {
+          timeout: 300_000, // 5 min clone timeout
+          maxBuffer: 10 * 1024 * 1024,
+        }, (err: Error | null) => {
+          if (err) reject(new Error(`git clone failed: ${err.message}`));
+          else resolve();
+        });
       });
       effectivePath = tempDir;
     }
+  } else if (repoPath) {
+    // Local path: save path and try to detect lastCommit for later re-use
+    localPath = repoPath;
+    try {
+      lastCommit = execSync('git rev-parse HEAD', { cwd: repoPath, encoding: 'utf-8' }).trim();
+    } catch {
+      // Not a git repo or git not available — non-fatal
+    }
   }
 
-  console.log(`[analyze] Starting analysis: ${effectivePath} → project ${projectId}`);
+  logger.info({ projectId, path: effectivePath }, 'Starting analysis');
 
   try {
     // ========================================
@@ -183,7 +231,8 @@ export async function runAnalyze(
     const pipelineRunner = options?.pipelineRunner ?? defaultPipelineRunner;
     const result = await pipelineRunner(effectivePath, options?.onProgress);
 
-    console.log(`[analyze] Pipeline extracted: ${result.nodes.length} nodes, ${result.relations.length} relations`);
+    logger.info({ projectId, nodeCount: result.nodes.length, relationCount: result.relations.length },
+      'Pipeline extracted');
 
     options?.onProgress?.('indexing', 50);
 
@@ -204,13 +253,82 @@ export async function runAnalyze(
       gitUrl, localPath, lastCommit,
     );
 
-    console.log(`[analyze] Analysis complete: project ${projectId}`);
+    logger.info({ projectId, nodeCount: stats.nodeCount, relationCount: stats.relationCount },
+      'Analysis pipeline completed');
+
+    // ========================================
+    // Empty result gate: if pipeline produced zero nodes/relations,
+    // mark as error instead of success. This prevents users from
+    // seeing "100% complete" but getting empty search results.
+    // ========================================
+    if (stats.nodeCount === 0 && stats.relationCount === 0) {
+      logger.error({ projectId, code: 'EMPTY_RESULT' },
+        'Pipeline produced zero nodes — marking as error');
+      throw new Error('EMPTY_RESULT: Pipeline produced zero nodes. This usually means tree-sitter parsing failed entirely.');
+    }
 
     // ========================================
     // Step 5: Temporal analysis (optional, requires git history)
     // ========================================
     if (process.env.ENABLE_TEMPORAL !== 'false') {
       await runTemporalStep(effectivePath, projectId, stores, options?.onProgress);
+    }
+
+    // ========================================
+    // Step 6: v1.4.0 Wiki auto-derivation (async dispatch by default)
+    // Triggers when wikiService is provided. Gracefully skips otherwise.
+    // - syncDerivation=true → legacy for-loop path (for tests with mocked LLM)
+    // - default → dispatch to llm-derivation queue via JobDispatcher
+    // ========================================
+    if (options?.wikiService) {
+      try {
+        const { loadRulesWithFallback } = await import('../wiki/derivation-rules.js');
+        const { CodeEntitySelector } = await import('../wiki/code-entity-selector.js');
+
+        const defaultRulesPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'config', 'derivation-rules.json');
+        const rules = loadRulesWithFallback(effectivePath, defaultRulesPath);
+
+        const selector = new CodeEntitySelector(rules, stores.graph);
+        const nodes = await selector.selectNodes(projectId);
+
+        if (nodes.length > 0 && rules.enabled !== false) {
+          if (options.syncDerivation) {
+            // Legacy sync path (for tests with mocked LLM)
+            const { WikiDerivationEngine } = await import('../wiki/derivation-engine.js');
+            const engine = new WikiDerivationEngine(
+              options.wikiService,
+              options.llmClient ?? stores.llm,
+              rules,
+            );
+            const deriveResult = await engine.deriveEntities(projectId, nodes);
+            logger.info(
+              { projectId, derived: deriveResult.derived, skipped: deriveResult.skipped, errors: deriveResult.errors.length, mode: 'sync' },
+              'Wiki derivation (sync mode)',
+            );
+          } else {
+            // v1.4.0: Async dispatch (production path)
+            const { JobDispatcher } = await import('./resilience/job-dispatcher.js');
+            const { llmDerivationQueue } = await import('./queue-setup.js');
+            const dispatcher = new JobDispatcher();
+            const batchSize = rules.dispatchBatchSize ?? 10;
+            const dispatchResult = await dispatcher.dispatch(
+              llmDerivationQueue,
+              nodes,
+              (batch) => ({ projectId, nodes: batch.map(n => n.id) }),
+              { batchSize, jobIdPrefix: `derive-${projectId}-${lastCommit ?? 'nogit'}` },
+            );
+            logger.info(
+              { projectId, batches: dispatchResult.batches, nodes: dispatchResult.dispatched, mode: 'async' },
+              'Wiki derivation dispatched',
+            );
+          }
+        }
+      } catch (err) {
+        logger.warn(
+          { projectId, error: err instanceof Error ? err.message : String(err) },
+          'Wiki auto-derivation failed (non-fatal)',
+        );
+      }
     }
 
     options?.onProgress?.('complete', 100);
@@ -221,9 +339,9 @@ export async function runAnalyze(
     if (tempDir) {
       try {
         rmSync(tempDir, { recursive: true, force: true });
-        console.log(`[analyze] Cleaned up temp dir: ${tempDir}`);
+        logger.info({ tempDir }, 'Cleaned up temp dir');
       } catch {
-        console.warn(`[analyze] Failed to clean up temp dir: ${tempDir}`);
+        logger.warn({ tempDir }, 'Failed to clean up temp dir');
       }
     }
   }
@@ -281,11 +399,11 @@ export async function writePipelineResultToStores(
 
   // Write nodes (batched)
   await stores.graph.batchCreateNodes(nodes);
-  console.log(`[analyze] Neo4j: ${nodes.length} nodes written`);
+  logger.info({ projectId, count: nodes.length }, 'Neo4j nodes written');
 
   // Write relations (batched)
   await stores.graph.batchCreateRelations(relations);
-  console.log(`[analyze] Neo4j: ${relations.length} relations written`);
+  logger.info({ projectId, count: relations.length }, 'Neo4j relations written');
 
   // Write communities as nodes
   const communityNodes: CodeNode[] = result.communities.map(c => ({
@@ -367,7 +485,7 @@ export async function writePipelineResultToStores(
 
   if (searchableDocs.length > 0) {
     await stores.search.indexDocuments(projectId, searchableDocs);
-    console.log(`[analyze] Typesense: ${searchableDocs.length} documents indexed`);
+    logger.info({ projectId, count: searchableDocs.length }, 'Typesense documents indexed');
   }
 
   // ========================================
@@ -381,7 +499,7 @@ export async function writePipelineResultToStores(
   if (embeddableNodes.length > 0) {
     const embeddingPipeline = new EmbeddingPipeline(stores.vector);
     await embeddingPipeline.indexEmbeddings(projectId, embeddableNodes);
-    console.log(`[analyze] Qdrant: ${embeddableNodes.length} vectors indexed`);
+    logger.info({ projectId, count: embeddableNodes.length }, 'Qdrant vectors indexed');
   }
 
   return {
@@ -429,13 +547,13 @@ export async function runTemporalStep(
     const gitOptions = since ? { since } : {};
     const { commits, isGitRepo } = extractGitLog(repoPath, gitOptions);
     if (!isGitRepo) {
-      console.log('[analyze] Not a git repository, skipping temporal analysis');
+      logger.info({ projectId }, 'Not a git repository, skipping temporal analysis');
       await onProgress?.('temporal', 100);
       return;
     }
 
     if (commits.length === 0) {
-      console.log('[analyze] No commits found, skipping temporal analysis');
+      logger.info({ projectId }, 'No commits found, skipping temporal analysis');
       await onProgress?.('temporal', 100);
       return;
     }
@@ -553,14 +671,43 @@ export async function runTemporalStep(
     // Write everything to Neo4j
     await writeCommits(commits, projectId, stores.graph);
     await writeAuthors(authors, stores.graph);
+
+    // C2: Apply author deduplication — merge duplicate authors by normalized key
+    // After writing raw authors, deduplicate and update the graph store
+    try {
+      const { deduplicateAuthors } = await import('../core/author-dedup.js');
+      const deduped = deduplicateAuthors(authors);
+      if (deduped.length < authors.length) {
+        logger.info({ projectId, rawCount: authors.length, dedupedCount: deduped.length },
+          'Author deduplication applied');
+        // Update each deduped author's canonical name in Neo4j
+        for (const d of deduped) {
+          if (d.aliases.length > 0) {
+            for (const email of d.emails) {
+              await stores.graph.query(
+                `MATCH (a:Author {id: $email})
+                 SET a.canonicalName = $canonicalName,
+                     a.aliases = $aliases,
+                     a.deduped = true`,
+                { email, canonicalName: d.canonicalName, aliases: d.aliases },
+              );
+            }
+          }
+        }
+      }
+    } catch (err) {
+      logger.warn({ projectId, err }, 'Author deduplication failed (non-fatal)');
+    }
+
     await writeChangedInRelations(allChangedInRelations, projectId, stores.graph);
     await writeAuthoredByRelations(authoredByRelations, stores.graph);
     await writeEvolvedFromRelations(renames, projectId, stores.graph);
 
-    console.log(
-      `[analyze] Temporal: ${commits.length} commits, ${authors.length} authors, ` +
-      `${allChangedInRelations.length} changes, ${renames.length} renames` +
-      (totalUnmapped > 0 ? ` (${totalUnmapped} unmapped)` : ''),
+    logger.info(
+      { projectId, commitCount: commits.length, authorCount: authors.length,
+        changeCount: allChangedInRelations.length, renameCount: renames.length,
+        unmapped: totalUnmapped || undefined },
+      'Temporal analysis completed',
     );
 
     // ========================================
@@ -593,16 +740,42 @@ export async function runTemporalStep(
     const filtered = filterNoisyCouplings(metrics);
     await writeCoChangedRelations(filtered, projectId, stores.graph, commits.length);
 
-    console.log(
-      `[analyze] Coupling: ${coOccurrence.length} pairs, ${filtered.length} after filtering`,
+    logger.info(
+      { projectId, coOccurrence: coOccurrence.length, filtered: filtered.length },
+      'Coupling analysis completed',
     );
 
     await onProgress?.('computing_coupling', 100);
 
     await onProgress?.('temporal', 100);
   } catch (err) {
-    console.warn('[analyze] Temporal analysis failed (non-fatal):', err);
+    logger.warn({ projectId, err }, 'Temporal analysis failed (non-fatal)');
     // Temporal failure is non-fatal — analysis still succeeds
     await onProgress?.('temporal', 100);
   }
+}
+
+/**
+ * Validate that a repoPath is safe to use — prevents path traversal attacks.
+ * Checks:
+ * 1. Path must be absolute
+ * 2. Path must not contain '..'
+ * 3. Path must be within REPO_ALLOWED_BASE (default: /data)
+ */
+export function validateRepoPath(p: string): string {
+  if (!p || typeof p !== 'string') {
+    throw new Error('repoPath must be a non-empty string');
+  }
+  if (!path.isAbsolute(p)) {
+    throw new Error('repoPath must be an absolute path');
+  }
+  const normalized = path.normalize(p);
+  if (normalized.includes('..') || normalized.includes('..\\')) {
+    throw new Error('repoPath contains path traversal (..)');
+  }
+  const allowedBase = process.env.REPO_ALLOWED_BASE || '/data';
+  if (!normalized.startsWith(allowedBase)) {
+    throw new Error(`repoPath must be under ${allowedBase}`);
+  }
+  return normalized;
 }

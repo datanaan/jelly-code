@@ -1,4 +1,4 @@
-// field-extractors/configs/typescript-javascript.ts
+// src/core/ingestion/field-extractors/configs/typescript-javascript.ts
 
 import { SupportedLanguages } from '@shared';
 import type { FieldExtractionConfig } from '../generic.js';

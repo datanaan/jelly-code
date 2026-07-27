@@ -1,4 +1,5 @@
 import { parentPort } from 'node:worker_threads';
+import { createRequire } from 'node:module';
 import Parser from 'tree-sitter';
 import JavaScript from 'tree-sitter-javascript';
 import TypeScript from 'tree-sitter-typescript';
@@ -11,11 +12,11 @@ import Go from 'tree-sitter-go';
 import Rust from 'tree-sitter-rust';
 import PHP from 'tree-sitter-php';
 import Ruby from 'tree-sitter-ruby';
-import { createRequire } from 'node:module';
 import { SupportedLanguages } from '@shared';
 import { getProvider } from '../languages/index.js';
 import { getTreeSitterBufferSize, TREE_SITTER_MAX_BUFFER } from '../constants.js';
 import { SymbolTable } from '../symbol-table.js';
+import { logger } from '../../logger.js';
 
 /** Language grammar type accepted by Parser.setLanguage(). */
 type TreeSitterLanguage = Parameters<typeof Parser.prototype.setLanguage>[0];
@@ -25,19 +26,25 @@ const _require = createRequire(import.meta.url);
 let Swift: TreeSitterLanguage | null = null;
 try {
   Swift = _require('tree-sitter-swift');
-} catch {}
+} catch (e: unknown) {
+  logger.info('tree-sitter-swift not available — Swift files will be skipped');
+}
 
 // tree-sitter-dart is an optionalDependency — may not be installed
 let Dart: TreeSitterLanguage | null = null;
 try {
   Dart = _require('tree-sitter-dart');
-} catch {}
+} catch (e: unknown) {
+  logger.info('tree-sitter-dart not available — Dart files will be skipped');
+}
 
 // tree-sitter-kotlin is an optionalDependency — may not be installed
 let Kotlin: TreeSitterLanguage | null = null;
 try {
   Kotlin = _require('tree-sitter-kotlin');
-} catch {}
+} catch (e: unknown) {
+  logger.info('tree-sitter-kotlin not available — Kotlin files will be skipped');
+}
 import { getLanguageFromFilename } from '@shared';
 import {
   FUNCTION_NODE_TYPES,

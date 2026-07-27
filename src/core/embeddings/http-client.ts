@@ -1,4 +1,8 @@
 /**
+ * @internal — superseded by EmbeddingService + RemoteService in v1.4.0.
+ * Retained for backward compatibility (some external callers may import httpEmbed).
+ * New code should use EmbeddingService.
+ *
  * HTTP Embedding Client
  *
  * Shared fetch+retry logic for OpenAI-compatible /v1/embeddings endpoints.

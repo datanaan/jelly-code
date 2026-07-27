@@ -1,4 +1,4 @@
-// method-extractors/generic.ts
+// src/core/ingestion/method-extractors/generic.ts
 
 /**
  * Generic table-driven method extractor factory.

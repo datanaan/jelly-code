@@ -192,6 +192,7 @@ describe('EmbeddingPipeline', () => {
       embedText: vi.fn().mockResolvedValue([0.1, 0.2, 0.3]),
       embeddingToArray: vi.fn((e: number[]) => e),
       isEmbedderReady: vi.fn().mockReturnValue(false),
+      getEmbeddingDimensions: vi.fn().mockReturnValue(384),
     }));
 
     const { EmbeddingPipeline } = await import('../../src/core/embeddings/embedding-pipeline.js');
@@ -218,6 +219,7 @@ describe('EmbeddingPipeline', () => {
       embedText: vi.fn(),
       embeddingToArray: vi.fn(),
       isEmbedderReady: vi.fn(),
+      getEmbeddingDimensions: vi.fn(),
     }));
 
     const { EmbeddingPipeline } = await import('../../src/core/embeddings/embedding-pipeline.js');
@@ -237,6 +239,7 @@ describe('EmbeddingPipeline', () => {
       embedText: vi.fn().mockResolvedValue([0.5, 0.5, 0.5]),
       embeddingToArray: vi.fn((e: number[]) => e),
       isEmbedderReady: vi.fn().mockReturnValue(true),
+      getEmbeddingDimensions: vi.fn().mockReturnValue(384),
     }));
 
     const { EmbeddingPipeline } = await import('../../src/core/embeddings/embedding-pipeline.js');
@@ -262,6 +265,7 @@ describe('EmbeddingPipeline', () => {
       embedText: vi.fn(),
       embeddingToArray: vi.fn((e: number[]) => e),
       isEmbedderReady: vi.fn().mockReturnValue(true),
+      getEmbeddingDimensions: vi.fn().mockReturnValue(384),
     }));
 
     const { EmbeddingPipeline } = await import('../../src/core/embeddings/embedding-pipeline.js');

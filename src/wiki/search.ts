@@ -78,15 +78,31 @@ export class WikiSearch {
 
   /**
    * Delete a wiki page from both stores.
+   *
+   * v1.3.0 fix: Previously a placeholder that did nothing. Now actually
+   * deletes from both backends:
+   *   - Typesense: deleteDocumentsByFilePath with the virtual filePath
+   *     used during indexing (`wiki/${pageType}/${pageId}`)
+   *   - Qdrant: deleteVectorsByNodeIds with the page ID
+   *
+   * Called by wiki_auto_fix delete-orphaned and undo-auto-derived to
+   * prevent stale search results pointing to deleted Neo4j entities.
    */
-  async deletePage(pageId: string): Promise<void> {
-    // Typesense doesn't have a per-document delete in ISearchStore,
-    // so we rely on re-indexing or batch operations.
-    // For now, this is a placeholder — actual deletion would require
-    // extending ISearchStore or using raw client access.
-    // The import script handles full re-import, so individual deletes
-    // are mainly for the lint/cleanup flow (Plan 2).
-    void pageId; // suppress unused warning
+  async deletePage(pageId: string, pageType: string = 'entity'): Promise<void> {
+    // Typesense: delete by the virtual filePath used during indexPage
+    const virtualFilePath = `wiki/${pageType}/${pageId}`;
+    try {
+      await this.search.deleteDocumentsByFilePath('wiki', virtualFilePath);
+    } catch {
+      // Non-fatal — Typesense may not have this document
+    }
+
+    // Qdrant: delete by node ID
+    try {
+      await this.vector.deleteVectorsByNodeIds('wiki', [pageId]);
+    } catch {
+      // Non-fatal — Qdrant may not have this point
+    }
   }
 
   /**

@@ -1,8 +1,8 @@
-# jelly-code Client Guide
+# Jelly Code 客户端接入指南
 
-> 服务地址: **http://localhost:8095**  
+> 服务地址: **http://172.80.1.198:8095**  
 > 部署日期: 2026-05-18  
-> 版本: v0.1.0
+> 版本: v1.3.1
 
 ---
 
@@ -10,11 +10,11 @@
 
 ```bash
 # 健康检查 (无需认证)
-curl http://localhost:8095/health
-# → {"status":"ok","mode":"standalone","version":"0.1.0"}
+curl http://172.80.1.198:8095/health
+# → {"status":"ok","mode":"standalone","version":"1.3.1"}
 
 # API 请求 (需认证)
-curl -H "x-api-key: your-api-key" http://localhost:8095/api/projects
+curl -H "x-api-key: dev_key_1" http://172.80.1.198:8095/api/projects
 # → {"projects":["my-project",...]}
 ```
 
@@ -154,17 +154,17 @@ Header: x-api-key: <key>
 
 | 项 | 值 |
 |----|-----|
-| 端点 | `http://localhost:8095/mcp` |
+| 端点 | `http://172.80.1.198:8095/mcp` |
 | 协议 | MCP StreamableHTTP (2024-11-05) |
 | 服务名 | `jelly-code` |
-| 版本 | `0.1.0` |
+| 版本 | `1.3.1` |
 | 认证 | `x-api-key` Header (每个请求都需携带) |
 | 方法 | `POST` |
 
 ### 4.2 初始化
 
 ```bash
-curl -X POST http://localhost:8095/mcp \
+curl -X POST http://172.80.1.198:8095/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -H "x-api-key: dev_key_1" \
@@ -183,7 +183,7 @@ curl -X POST http://localhost:8095/mcp \
 ### 4.3 列出工具
 
 ```bash
-curl -X POST http://localhost:8095/mcp \
+curl -X POST http://172.80.1.198:8095/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -H "x-api-key: dev_key_1" \
@@ -196,7 +196,7 @@ curl -X POST http://localhost:8095/mcp \
   }'
 ```
 
-### 4.4 可用的 12 个 MCP 工具
+### 4.4 可用的 15+ 个 MCP 工具
 
 | 工具 | 描述 |
 |------|------|
@@ -212,6 +212,9 @@ curl -X POST http://localhost:8095/mcp \
 | `tool_map` | 展示 MCP/RPC 工具定义 |
 | `shape_check` | 检查 API 响应 shape vs 消费者访问 |
 | `api_impact` | 变更前 API 路由影响报告 |
+| `find_dead_code` | 死代码检测 — 导出/非导出/自引用符号，置信度评分 |
+| `list_dependencies` | 依赖清单 — 外部包 (node_modules) + 内部模块 (按目录分组) |
+| `affected_tests` | 测试影响分析 — 直接导入/调用链/未测试文件 |
 
 ---
 
@@ -220,7 +223,7 @@ curl -X POST http://localhost:8095/mcp \
 ### 5.1 Node.js (REST API)
 
 ```javascript
-const BASE = 'http://localhost:8095';
+const BASE = 'http://172.80.1.198:8095';
 const API_KEY = 'dev_key_1';
 
 // 列出项目
@@ -251,7 +254,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
 const transport = new StreamableHTTPClientTransport(
-  new URL('http://localhost:8095/mcp'),
+  new URL('http://172.80.1.198:8095/mcp'),
   {
     requestInit: {
       headers: { 'x-api-key': 'dev_key_1' },
@@ -291,12 +294,12 @@ const ctx = await client.callTool({
 ```python
 import requests
 
-BASE = "http://localhost:8095"
+BASE = "http://172.80.1.198:8095"
 HEADERS = {"x-api-key": "dev_key_1"}
 
 # 健康检查
 resp = requests.get(f"{BASE}/health")
-print(resp.json())  # {"status":"ok","mode":"standalone","version":"0.1.0"}
+print(resp.json())  # {"status":"ok","mode":"standalone","version":"1.3.1"}
 
 # 列出项目
 resp = requests.get(f"{BASE}/api/projects", headers=HEADERS)
@@ -318,8 +321,8 @@ print(resp.json())  # {"status":"started","projectId":"my-python-project"}
 
 ```bash
 #!/bin/bash
-BASE="http://localhost:8095"
-KEY="your-api-key"
+BASE="http://172.80.1.198:8095"
+KEY="dev_key_1"
 
 echo "=== 健康检查 ==="
 curl -s "$BASE/health" | python3 -m json.tool
@@ -345,7 +348,7 @@ curl -s -X POST "$BASE/api/analyze" \
 {
   "mcpServers": {
     "jelly-code": {
-      "url": "http://localhost:8095/mcp",
+      "url": "http://172.80.1.198:8095/mcp",
       "headers": {
         "x-api-key": "dev_key_1"
       }

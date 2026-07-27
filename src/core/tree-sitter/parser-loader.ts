@@ -1,5 +1,5 @@
 /**
- * Tree-sitter parser loader.
+ * Tree-sitter parser loader — replaces jelly-code's ../tree-sitter/parser-loader.js
  *
  * Loads tree-sitter parsers and languages on demand.
  * Each language binding is lazy-loaded to avoid startup cost for unused languages.

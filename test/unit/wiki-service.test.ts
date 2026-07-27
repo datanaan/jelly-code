@@ -9,8 +9,14 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // Mock the embedding module before importing WikiService
 vi.mock('../../src/core/embeddings/embedder.js', () => ({
+  initEmbedder: vi.fn().mockResolvedValue(undefined),
   embedText: vi.fn(async (_text: string) => new Float32Array(384).fill(0.1)),
+  embedBatch: vi.fn().mockResolvedValue([new Float32Array(384).fill(0.1)]),
   embeddingToArray: vi.fn((vec: Float32Array) => Array.from(vec)),
+  isEmbedderReady: vi.fn().mockReturnValue(false),
+  getEmbeddingDimensions: vi.fn().mockReturnValue(384),
+  getEmbedder: vi.fn(),
+  disposeEmbedder: vi.fn(),
 }));
 
 import { WikiService, type WikiConfig } from '../../src/wiki/service.js';
@@ -818,6 +824,266 @@ describe('WikiService', () => {
 
       expect(result.pagesSynced).toBe(2); // 1 entity + 1 topic
       expect(result.errors).toHaveLength(0);
+    });
+  });
+
+  // ==========================================
+  // Idempotency & Concurrency Control Tests
+  // ==========================================
+  describe('activeTasks cleanup (F1)', () => {
+    it('tracks tasks and processingProjects prevents duplicate startIngest', async () => {
+      const stores = createMockStoreSet();
+      const service = new WikiService(stores, testWikiConfig);
+
+      const first = service.startIngest(testProjectId, '/tmp/fake.md');
+      expect(first).not.toBeNull();
+
+      // Verify task is tracked
+      const tasks = service.getActiveTasks(testProjectId);
+      expect(tasks.has(first!)).toBe(true);
+    });
+
+    it('processingProjects prevents duplicate startIngest for same file', async () => {
+      const stores = createMockStoreSet();
+      const service = new WikiService(stores, testWikiConfig);
+
+      const first = service.startIngest(testProjectId, '/tmp/same-file.md');
+      const second = service.startIngest(testProjectId, '/tmp/same-file.md');
+
+      expect(first).not.toBeNull();
+      expect(second).toBeNull(); // blocked by concurrent control
+    });
+
+    it('processingProjects allows different files concurrently', async () => {
+      const stores = createMockStoreSet();
+      const service = new WikiService(stores, testWikiConfig);
+
+      const first = service.startIngest(testProjectId, '/tmp/file-a.md');
+      const second = service.startIngest(testProjectId, '/tmp/file-b.md');
+
+      expect(first).not.toBeNull();
+      expect(second).not.toBeNull(); // different file, allowed
+    });
+
+    it('processingProjects prevents duplicate startAutoDiscover for same project+repo', async () => {
+      const stores = createMockStoreSet();
+      const service = new WikiService(stores, testWikiConfig);
+
+      const first = service.startAutoDiscover(testProjectId, '/tmp/repo');
+      const second = service.startAutoDiscover(testProjectId, '/tmp/repo');
+
+      expect(first).not.toBeNull();
+      expect(second).toBeNull(); // blocked
+    });
+
+    it('trackTask evicts oldest completed task when map exceeds maxActiveTasks', async () => {
+      const stores = createMockStoreSet();
+      const service = new WikiService(stores, testWikiConfig);
+
+      // Access private maxActiveTasks via any cast — reduce to 3 for test
+      (service as any).maxActiveTasks = 3;
+
+      // Track 3 tasks (all in-flight, no eviction)
+      service.startIngest(testProjectId, '/tmp/file-1.md');
+      service.startIngest(testProjectId, '/tmp/file-2.md');
+      service.startIngest(testProjectId, '/tmp/file-3.md');
+
+      let tasks = service.getActiveTasks(testProjectId);
+      expect(tasks.size).toBe(3);
+
+      // Manually set task 1 as completed (oldest)
+      const taskIds = [...tasks.keys()];
+      const task1 = tasks.get(taskIds[0])!;
+      task1.status = 'done';
+      task1.completedAt = new Date(Date.now() - 7200000).toISOString(); // 2h ago
+
+      // Now track a 4th task — should evict task 1
+      service.startIngest(testProjectId, '/tmp/file-4.md');
+
+      tasks = service.getActiveTasks(testProjectId);
+      // Map should still be at or below maxActiveTasks
+      expect(tasks.size).toBeLessThanOrEqual(3);
+    });
+  });
+
+  describe('query write-back dedup (F4)', () => {
+    it('creates new Topic when no existing Topic for question', async () => {
+      const llm = createMockLLM({ textResponse: 'Answer.' });
+      const stores = createMockStoreSet(llm);
+      const service = new WikiService(stores, { staleDays: 30, autoWriteBack: true });
+
+      await service.query(testProjectId, 'New question', true);
+      // Should have called createTopic (MERGE WikiTopic)
+      const topicQueries = (stores.graph as any).queries.filter(
+        (q: any) => q.cypher.includes('WikiTopic'),
+      );
+      expect(topicQueries.length).toBeGreaterThan(0);
+    });
+
+    it('updates existing Topic when same question is asked again', async () => {
+      const llm = createMockLLM({ textResponse: 'Updated answer.' });
+      const stores = createMockStoreSet(llm);
+      const service = new WikiService(stores, { staleDays: 30, autoWriteBack: true });
+
+      // Mock the WikiGraph.query to intercept the topic existence check
+      const originalQuery = (stores.graph as any).query;
+      (stores.graph as any).query = vi.fn(async (cypher: string, params: any) => {
+        // Return existing topic when checking for duplicate
+        if (cypher.includes('WikiTopic') && cypher.includes('RETURN t.id')) {
+          return [{ id: 'existing-topic-id' }];
+        }
+        return originalQuery(cypher, params);
+      });
+
+      await service.query(testProjectId, 'Same question', true);
+
+      // Verify: the update query (SET) was used instead of createTopic (MERGE)
+      const allQueries = (stores.graph as any).queries;
+      const setTopicQueries = allQueries.filter(
+        (q: any) => q.cypher.includes('SET') && q.cypher.includes('compiled_at'),
+      );
+      expect(setTopicQueries.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe('content hash skip (F5)', () => {
+    it('skips LLM when content hash matches existing source', async () => {
+      const crypto = await import('crypto');
+      const content = 'Unchanged content';
+      const expectedHash = crypto.createHash('sha256').update(content).digest('hex');
+
+      const llm = createMockLLM();
+      const stores = createMockStoreSet(llm);
+
+      // Mock graph: return existing source with matching content_hash
+      (stores.graph as any).query = vi.fn(async (cypher: string) => {
+        if (cypher.includes('content_hash')) {
+          return [{ hash: expectedHash, llmHash: '' }];
+        }
+        return [];
+      });
+
+      const service = new WikiService(stores, testWikiConfig);
+      const result = await service.ingest(testProjectId, '/tmp/fake.md', content);
+
+      // LLM should NOT have been called (hash matched)
+      expect(llm.generateJSON).not.toHaveBeenCalled();
+      expect(result.skipped).toBe(true);
+    });
+
+    it('calls LLM when content hash does NOT match', async () => {
+      const crypto = await import('crypto');
+      const oldContent = 'Old content';
+      const newContent = 'New content';
+      const oldHash = crypto.createHash('sha256').update(oldContent).digest('hex');
+
+      const llm = createMockLLM();
+      const stores = createMockStoreSet(llm);
+
+      // Mock graph: return existing source with OLD content_hash
+      (stores.graph as any).query = vi.fn(async (cypher: string) => {
+        if (cypher.includes('content_hash')) {
+          return [{ hash: oldHash, llmHash: '' }];
+        }
+        return [];
+      });
+
+      const service = new WikiService(stores, testWikiConfig);
+      const result = await service.ingest(testProjectId, '/tmp/fake.md', newContent);
+
+      // LLM should have been called (hash mismatch)
+      expect(llm.generateJSON).toHaveBeenCalled();
+      expect(result.skipped).toBeFalsy();
+    });
+  });
+
+  describe('LLM output hash skip (F6)', () => {
+    it('skips writes when LLM output matches existing', async () => {
+      const crypto = await import('crypto');
+      const content = 'Content that produces same LLM output';
+
+      // Compute the expected LLM output hash
+      const compileOutput: CompileOutput = {
+        title: 'Test Doc',
+        summary: 'Same output',
+        keyPoints: ['k1'],
+        entities: [],
+        existingUpdates: [],
+        contradictions: [],
+      };
+      // Must match the fingerprint logic in service.ts (subset of semantic fields)
+      const fingerprint = JSON.stringify({
+        title: compileOutput.title,
+        summary: compileOutput.summary,
+        keyPoints: compileOutput.keyPoints,
+        entities: compileOutput.entities.map(e => ({
+          name: e.name,
+          type: e.type,
+          definition: e.definition,
+        })),
+        existingUpdates: compileOutput.existingUpdates.map(e => ({
+          entityName: e.entityName,
+          newInfo: e.newInfo,
+        })),
+      });
+      const llmOutputHash = crypto.createHash('sha256').update(fingerprint).digest('hex');
+
+      const llm = createMockLLM({ jsonResponse: compileOutput });
+      const stores = createMockStoreSet(llm);
+
+      let graphQueryCount = 0;
+      (stores.graph as any).query = vi.fn(async (cypher: string) => {
+        graphQueryCount++;
+        // Return source with content_hash that DOESN'T match (content changed)
+        // but llm_output_hash that MATCHES (LLM output unchanged)
+        if (cypher.includes('content_hash')) {
+          return [{ hash: 'different-hash', llmHash: llmOutputHash }];
+        }
+        return [];
+      });
+
+      const service = new WikiService(stores, testWikiConfig);
+      const result = await service.ingest(testProjectId, '/tmp/fake.md', content);
+
+      // LLM should have been called (content changed)
+      expect(llm.generateJSON).toHaveBeenCalled();
+      // But writes should be skipped (LLM output unchanged)
+      expect(result.skipped).toBe(true);
+    });
+  });
+
+  describe('start* null return for all 5 methods (F8)', () => {
+    it('startBatchIngestContent returns null when blocked', async () => {
+      const stores = createMockStoreSet();
+      const service = new WikiService(stores, testWikiConfig);
+
+      const first = service.startBatchIngestContent(testProjectId, [{ source_path: '/tmp/a.md', content: 'a' }]);
+      const second = service.startBatchIngestContent(testProjectId, [{ source_path: '/tmp/b.md', content: 'b' }]);
+
+      expect(first).not.toBeNull();
+      expect(second).toBeNull();
+    });
+
+    it('startBatchIngest returns null when blocked', async () => {
+      const stores = createMockStoreSet();
+      const service = new WikiService(stores, testWikiConfig);
+
+      const first = service.startBatchIngest(testProjectId, '/tmp/dir');
+      const second = service.startBatchIngest(testProjectId, '/tmp/dir');
+
+      expect(first).not.toBeNull();
+      expect(second).toBeNull();
+    });
+
+    it('startEvolutionStoryGeneration returns null when blocked', async () => {
+      const stores = createMockStoreSet();
+      const service = new WikiService(stores, testWikiConfig);
+
+      const first = service.startEvolutionStoryGeneration(testProjectId, 'node-1');
+      const second = service.startEvolutionStoryGeneration(testProjectId, 'node-1');
+
+      expect(first).not.toBeNull();
+      expect(second).toBeNull();
     });
   });
 });

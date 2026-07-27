@@ -536,4 +536,183 @@ describe('WikiService.ingest — codeSignature binding (P0c-T3)', () => {
       await cleanup();
     }
   });
+
+  // ─── v1.3.0 Phase 1 T1-3: Cross-domain edge dual-write ───────────────
+
+  it('T1-3: writes DESCRIBES + DOCUMENTED_BY edges when codeSignature binds', async () => {
+    const compileOutput: CompileOutput = {
+      title: 'API Docs',
+      summary: 'Docs about greet function',
+      keyPoints: [],
+      entities: [
+        {
+          name: 'GreetFunction',
+          type: 'api',
+          definition: 'A greeting function',
+          details: 'The greet function says hello',
+          links: [{ target: 'greet', relationship: 'describes' }],
+        },
+      ],
+      existingUpdates: [],
+      contradictions: [],
+    };
+
+    const llm = createMockLLM(compileOutput);
+    const graph = createMockGraph();
+    graph.findSymbol.mockResolvedValue([
+      {
+        id: 'node-greet',
+        type: 'Function',
+        projectId: PROJECT_ID,
+        name: 'greet',
+        filePath: 'src/greet.ts',
+        content: FUNCTION_SOURCE,
+      } as CodeNode,
+    ]);
+
+    const stores = createMockStoreSet(llm, graph);
+    const service = new WikiService(stores, testWikiConfig);
+
+    const { file, cleanup } = await createTempFile('Content');
+    try {
+      await service.ingest(PROJECT_ID, file);
+
+      // Find the cross-domain edge write query
+      const crossDomainQuery = graph.queries.find(
+        q => q.cypher.includes(':DESCRIBES') && q.cypher.includes(':DOCUMENTED_BY'),
+      );
+      expect(crossDomainQuery).toBeDefined();
+
+      // CK-1: Real Neo4j edge Cypher (not JSON property simulation)
+      expect(crossDomainQuery!.cypher).toContain('MERGE');
+      expect(crossDomainQuery!.cypher).toContain('WikiEntity');
+
+      // CK-5: bi-temporal properties in Cypher
+      expect(crossDomainQuery!.cypher).toContain('valid_from');
+      expect(crossDomainQuery!.cypher).toContain('txn_from');
+
+      // CK-4: projectId isolation in params
+      expect(crossDomainQuery!.params.projectId).toBe(PROJECT_ID);
+
+      // Entity id and code node id passed correctly
+      expect(crossDomainQuery!.params.entityId).toBeDefined();
+      expect(crossDomainQuery!.params.codeNodeId).toBe('node-greet');
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('T1-3: does NOT write cross-domain edges when no describes link', async () => {
+    const compileOutput: CompileOutput = {
+      title: 'Concept Doc',
+      summary: 'No code binding',
+      keyPoints: [],
+      entities: [
+        {
+          name: 'PureConcept',
+          type: 'concept',
+          definition: 'A pure concept',
+          details: 'No code relationship',
+          links: [{ target: 'other', relationship: 'related to' }],
+        },
+      ],
+      existingUpdates: [],
+      contradictions: [],
+    };
+
+    const llm = createMockLLM(compileOutput);
+    const graph = createMockGraph();
+    const stores = createMockStoreSet(llm, graph);
+    const service = new WikiService(stores, testWikiConfig);
+
+    const { file, cleanup } = await createTempFile('Content');
+    try {
+      await service.ingest(PROJECT_ID, file);
+
+      // No cross-domain edges should be written
+      const crossDomainQuery = graph.queries.find(
+        q => q.cypher.includes(':DESCRIBES') || q.cypher.includes(':DOCUMENTED_BY'),
+      );
+      expect(crossDomainQuery).toBeUndefined();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  it('T1-3: does NOT write cross-domain edges when describes target not found', async () => {
+    const compileOutput: CompileOutput = {
+      title: 'Stale Docs',
+      summary: 'References missing code',
+      keyPoints: [],
+      entities: [
+        {
+          name: 'MissingApi',
+          type: 'api',
+          definition: 'An API that no longer exists',
+          details: 'This described a removed function',
+          links: [{ target: 'removedFunc', relationship: 'describes' }],
+        },
+      ],
+      existingUpdates: [],
+      contradictions: [],
+    };
+
+    const llm = createMockLLM(compileOutput);
+    const graph = createMockGraph();
+    graph.findSymbol.mockResolvedValue([]); // code node not found
+
+    const stores = createMockStoreSet(llm, graph);
+    const service = new WikiService(stores, testWikiConfig);
+
+    const { file, cleanup } = await createTempFile('Content');
+    try {
+      await service.ingest(PROJECT_ID, file);
+
+      const crossDomainQuery = graph.queries.find(
+        q => q.cypher.includes(':DESCRIBES') || q.cypher.includes(':DOCUMENTED_BY'),
+      );
+      expect(crossDomainQuery).toBeUndefined();
+    } finally {
+      await cleanup();
+    }
+  });
+
+  // ─── v1.3.0 Phase 1 T1-5: ingest path sets provenance='manual' ──────
+
+  it('T1-5: ingest marks new WikiEntity with provenance=manual', async () => {
+    const compileOutput: CompileOutput = {
+      title: 'Doc',
+      summary: 'Summary',
+      keyPoints: [],
+      entities: [
+        {
+          name: 'IngestedEntity',
+          type: 'api',
+          definition: 'def',
+          details: 'det',
+          links: [],
+        },
+      ],
+      existingUpdates: [],
+      contradictions: [],
+    };
+
+    const llm = createMockLLM(compileOutput);
+    const graph = createMockGraph();
+    const stores = createMockStoreSet(llm, graph);
+    const service = new WikiService(stores, testWikiConfig);
+
+    const { file, cleanup } = await createTempFile('Content');
+    try {
+      await service.ingest(PROJECT_ID, file);
+
+      const createQueries = captureCreateEntityParams(graph);
+      const entityQuery = createQueries.find(q => q.params.name === 'IngestedEntity');
+      expect(entityQuery).toBeDefined();
+      // CK-3 / T1-5: provenance is a real Neo4j property, not a comment
+      expect(entityQuery!.params.provenance).toBe('manual');
+    } finally {
+      await cleanup();
+    }
+  });
 });

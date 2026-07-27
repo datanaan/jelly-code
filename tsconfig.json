@@ -29,6 +29,8 @@
     "src/core/graph/**/*.ts",
     "src/core/tree-sitter/**/*.ts",
     "src/core/ingestion/index.d.ts",
+    "src/core/ingestion/pipeline-core.ts",
+    "src/core/ingestion/pipeline-stages.ts",
     "src/types/**/*.ts",
     "src/lib/**/*.ts",
     "src/shared/**/*.ts",

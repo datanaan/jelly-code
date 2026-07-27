@@ -1,4 +1,4 @@
-// field-extractors/configs/helpers.ts
+// src/core/ingestion/field-extractors/configs/helpers.ts
 
 /**
  * Shared AST-walking helpers used by multiple language configs.

@@ -1,4 +1,4 @@
-// field-extractors/configs/rust.ts
+// src/core/ingestion/field-extractors/configs/rust.ts
 
 import { SupportedLanguages } from '@shared';
 import type { FieldExtractionConfig } from '../generic.js';

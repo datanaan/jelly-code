@@ -1,5 +1,5 @@
 # ============================================================
-# Code Knowledge Graph - 后端基础设施 (docker compose)
+# jelly-code - 后端基础设施 (docker compose)
 #
 # 管理命令:
 #   docker compose up -d     启动
@@ -7,7 +7,7 @@
 #   docker compose ps        状态
 #   docker compose logs -f   日志
 #
-# 注意: 应用本体和 Qdrant 由 systemd 直接管理，不在此文件
+# 注意: jelly-code 应用本体和 Qdrant 由 systemd 直接管理，不在此文件
 #
 # 配置:
 #   - 创建 .env 文件并设置 NEO4J_PASSWORD 和 TYPESENSE_API_KEY
@@ -24,7 +24,8 @@ services:
     environment:
       NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-password123}
     volumes:
-      - neo4j-data:/data
+      - /data/neo4j-data:/data
+      - /data/neo4j-data/conf/neo4j.conf:/conf/neo4j.conf:ro
     healthcheck:
       test: ["CMD-SHELL", "timeout 5 bash -c 'echo > /dev/tcp/localhost/7687' || exit 1"]
       interval: 15s
@@ -41,15 +42,11 @@ services:
     environment:
       TYPESENSE_API_KEY: ${TYPESENSE_API_KEY:-dev-key}
     volumes:
-      - typesense-data:/data
+      - /data/typesense-data:/data
     command: [--data-dir, /data, --api-key, ${TYPESENSE_API_KEY:-dev-key}]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8108/health"]
+      test: ["CMD-SHELL", "timeout 3 bash -c 'echo > /dev/tcp/localhost/8108' || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 5
     restart: unless-stopped
-
-volumes:
-  neo4j-data:
-  typesense-data:

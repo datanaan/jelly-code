@@ -21,6 +21,27 @@ import { join, dirname } from 'path';
 import { createRequire } from 'module';
 import { DEFAULT_EMBEDDING_CONFIG, type EmbeddingConfig, type ModelProgress } from './types.js';
 import { isHttpMode, getHttpDimensions, httpEmbed } from './http-client.js';
+import { loadEmbeddingServiceConfig } from './config.js';
+import { EmbeddingService } from './embedding-service.js';
+
+// Module-level singleton for the HTTP-pool EmbeddingService (http-pool mode).
+// null when in local (transformers.js) mode or before first use.
+let embeddingService: EmbeddingService | null = null;
+
+/**
+ * Lazily instantiate an EmbeddingService if http-pool mode is configured.
+ * Returns null in local mode, so callers fall through to transformers.js.
+ * Exported so health routes can access the service instance.
+ */
+export function getEmbeddingService(): EmbeddingService | null {
+  if (embeddingService) return embeddingService;
+  const cfg = loadEmbeddingServiceConfig();
+  if (cfg.mode === 'http-pool') {
+    embeddingService = new EmbeddingService(cfg);
+    return embeddingService;
+  }
+  return null;  // local mode — use existing transformers.js path
+}
 
 /**
  * Check whether the onnxruntime-node package that @huggingface/transformers
@@ -124,6 +145,15 @@ export const initEmbedder = async (
   config: Partial<EmbeddingConfig> = {},
   forceDevice?: 'dml' | 'cuda' | 'cpu' | 'wasm',
 ): Promise<FeatureExtractionPipeline> => {
+  // http-pool mode: EmbeddingService is always "ready", init is a no-op caller error
+  const poolCfg = loadEmbeddingServiceConfig();
+  if (poolCfg.mode === 'http-pool') {
+    throw new Error(
+      'initEmbedder() should not be called in http-pool embedding mode. ' +
+        'Use embedText()/embedBatch() which delegate to EmbeddingService.',
+    );
+  }
+  // Legacy single-endpoint http-client mode
   if (isHttpMode()) {
     throw new Error(
       'initEmbedder() should not be called in HTTP mode. ' +
@@ -245,7 +275,12 @@ export const initEmbedder = async (
  * Check if the embedder is initialized and ready
  */
 export const isEmbedderReady = (): boolean => {
-  return isHttpMode() || embedderInstance !== null;
+  const cfg = loadEmbeddingServiceConfig();
+  if (cfg.mode === 'http-pool') return true;  // pool is always "ready", failover handled internally
+  // Legacy single-endpoint http-client mode
+  if (isHttpMode()) return true;
+  // Local transformers.js mode
+  return embedderInstance !== null;
 };
 
 /**
@@ -253,9 +288,16 @@ export const isEmbedderReady = (): boolean => {
  * In HTTP mode, uses CODE_EMBEDDING_DIMS if set, otherwise the default.
  */
 export const getEmbeddingDimensions = (): number => {
+  // http-pool mode: read centralized config
+  const cfg = loadEmbeddingServiceConfig();
+  if (cfg.mode === 'http-pool') {
+    return cfg.dimensions;
+  }
+  // Legacy single-endpoint http-client mode
   if (isHttpMode()) {
     return getHttpDimensions() ?? DEFAULT_EMBEDDING_CONFIG.dimensions;
   }
+  // Local transformers.js mode
   return DEFAULT_EMBEDDING_CONFIG.dimensions;
 };
 
@@ -281,6 +323,13 @@ export const getEmbedder = (): FeatureExtractionPipeline => {
  * @returns Float32Array of embedding vector
  */
 export const embedText = async (text: string): Promise<Float32Array> => {
+  // 1. http-pool mode: delegate to EmbeddingService (multi-endpoint + resilience)
+  const svc = getEmbeddingService();
+  if (svc) {
+    const [vec] = await svc.embed([text]);
+    return vec;
+  }
+  // 2. Legacy http-client mode (single endpoint via CODE_EMBEDDING_URL)
   if (isHttpMode()) {
     const [vec] = await httpEmbed([text]);
     return vec;
@@ -309,6 +358,11 @@ export const embedBatch = async (texts: string[]): Promise<Float32Array[]> => {
     return [];
   }
 
+  // 1. http-pool mode: delegate to EmbeddingService (batching handled internally)
+  const svc = getEmbeddingService();
+  if (svc) return svc.embed(texts);
+
+  // 2. Legacy http-client mode (single endpoint via CODE_EMBEDDING_URL)
   if (isHttpMode()) {
     return httpEmbed(texts);
   }

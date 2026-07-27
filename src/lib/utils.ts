@@ -1,14 +1,15 @@
 /**
- * Utility functions.
+ * Utility functions — replaces jelly-code's ../../lib/utils.js
  *
  * generateId creates deterministic node/relation IDs from labels and keys.
- * IDs follow the format "Label:key1:key2:..." for nodes and "Label:id1->id2" for relations.
+ * This must be consistent with jelly-code's ID generation to maintain
+ * data compatibility when re-indexing the same repository.
  */
 
 /**
  * Generate a deterministic ID from a label and key parts.
  *
- * Format: "Label:key1:key2:..." e.g. "File:src/index.ts", "CALLS:id1->id2"
+ * jelly-code format: "Label:key1:key2:..." e.g. "File:src/index.ts", "CALLS:id1->id2"
  *
  * For relation IDs (type with multiple parts), joins with '->'.
  * For node IDs (single label + path), joins with ':'.

@@ -125,6 +125,15 @@ export class TypesenseAdapter implements ISearchStore {
     }
   }
 
+  async healthCheck(): Promise<boolean> {
+    try {
+      await this.client.collections().retrieve();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   async close(): Promise<void> {
     // Typesense client doesn't need explicit close
   }

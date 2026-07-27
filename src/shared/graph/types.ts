@@ -1,9 +1,8 @@
 /**
  * Graph type definitions — single source of truth.
  *
- * Shared across the code analysis pipeline and MCP tools.
- * These types define the knowledge graph's node labels, relationship types,
- * and property shapes used throughout the project.
+ * Both CLI and web import from this package.
+ * Do NOT add Node.js-specific or browser-specific imports here.
  */
 
 import { SupportedLanguages } from '../languages.js';

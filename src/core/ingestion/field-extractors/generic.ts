@@ -1,4 +1,4 @@
-// field-extractors/generic.ts
+// src/core/ingestion/field-extractors/generic.ts
 
 /**
  * Generic table-driven field extractor factory.

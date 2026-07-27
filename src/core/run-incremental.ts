@@ -23,16 +23,19 @@
 import type { StoreSet } from '../store/interfaces.js';
 import type { PipelineResult } from '../types/pipeline.js';
 import type { RepoCacheManager } from './repo-cache.js';
+import * as path from 'path';
 import { detectChanges } from './change-detector.js';
 import type { ChangeSet } from './change-detector.js';
 import { findReverseDependencies } from './reverse-dependency-finder.js';
 import { runAnalyze, writePipelineResultToStores, defaultPipelineRunner, runTemporalStep } from './run-analyze.js';
+import { cleanupQueue } from './queue-setup.js';
 import { IncrementalFallbackError } from './incremental-fallback-error.js';
 import { rebuildCommunities } from './community-rebuilder.js';
 import type { PipelineOptions } from './ingestion/pipeline.js';
 import { WikiGraph } from '../wiki/graph.js';
 import { checkEntityFreshness } from '../wiki/entity-freshness.js';
 import type { EntityFreshnessState } from '../wiki/entity-freshness.js';
+import { logger } from './logger.js';
 
 /**
  * P1-T3: Bi-temporal constants for supersede.
@@ -46,6 +49,27 @@ import type { EntityFreshnessState } from '../wiki/entity-freshness.js';
  * coalesce(valid_from, EPOCH) — see bitemporal-queries.ts T2.
  */
 const SUPERSEDE_TIME = new Date().toISOString();
+
+// ========================================
+// Community rebuild threshold constants
+// ========================================
+
+/** Minimum number of accumulated changes before triggering community rebuild. */
+export const COMMUNITY_CHANGE_MIN = 50;
+
+/** Ratio of changed files to total files before triggering community rebuild. */
+export const COMMUNITY_CHANGE_RATIO = 0.05;
+
+/** Max days since last community rebuild before forcing a refresh. */
+export const COMMUNITY_STALE_DAYS = 7;
+
+/**
+ * Compute the community rebuild threshold for a given total file count.
+ * Scales with repo size: max(MIN, totalFiles * RATIO).
+ */
+export function computeCommunityThreshold(totalFiles: number): number {
+  return Math.max(COMMUNITY_CHANGE_MIN, Math.floor(Math.max(totalFiles, 1) * COMMUNITY_CHANGE_RATIO));
+}
 
 export interface StaleWikiEntity {
   entityId: string;
@@ -84,6 +108,16 @@ export async function runIncrementalAnalyze(
     onProgress?: (phase: string, percent: number) => void;
     /** Pre-computed change set from scheduler, avoids calling detectChanges twice */
     precomputedChangeSet?: ChangeSet;
+    /**
+     * v1.3.0 Phase 3 T3-4b (D2 fix): WikiService for incremental auto-derivation.
+     * When provided, triggers auto-derive for changed files after incremental analysis.
+     */
+    wikiService?: import('../wiki/service.js').WikiService;
+    /** v1.4.0: dispatch derivation synchronously (legacy path, for tests).
+     * Default: false (async dispatch via JobDispatcher + llm-derivation queue). */
+    syncDerivation?: boolean;
+    /** v1.4.0: override LLM client (primarily for tests with mocked LLM). */
+    llmClient?: import('../llm/interface.js').ILLMClient;
   },
 ): Promise<IncrementalResult> {
   // 1. Get project info from Neo4j
@@ -105,15 +139,15 @@ export async function runIncrementalAnalyze(
 
   // 3. Detect changes (use precomputed if available, e.g. from scheduler)
   const changeSet = options?.precomputedChangeSet ?? await (async () => {
-    console.time('[timing] detectChanges');
+    logger.info({ projectId }, '[timing] detectChanges');
     const cs = await detectChanges(localPath, stores.graph, projectId);
-    console.timeEnd('[timing] detectChanges');
+    logger.info({ projectId }, '[timing] detectChanges complete');
     return cs;
   })();
 
   // 4. If no change data, fall back to full analysis
   if (!changeSet) {
-    console.log(`[incremental] No previous analysis found, running full analysis for ${projectId}`);
+    logger.info({ projectId }, 'No previous analysis found, running full analysis');
     await stores.graph.clearProject(projectId);
     const stats = await runAnalyze('', projectId, stores, {
       gitUrl,
@@ -127,7 +161,7 @@ export async function runIncrementalAnalyze(
   // 5. If no changes detected
   const totalChanges = changeSet.modified.length + changeSet.deleted.length + changeSet.added.length;
   if (totalChanges === 0) {
-    console.log(`[incremental] No changes detected for ${projectId}`);
+    logger.info({ projectId }, 'No changes detected');
     const staleWikiEntities = await checkWikiFreshness(projectId, stores);
     return {
       mode: 'incremental',
@@ -140,7 +174,7 @@ export async function runIncrementalAnalyze(
     };
   }
 
-  console.log(`[incremental] Processing ${totalChanges} changed files for ${projectId}`);
+  logger.info({ projectId, totalChanges }, 'Processing changed files');
 
   // 5.5. Query reverse dependencies BEFORE deletion (critical: old relationships must still exist)
   // Must include deleted files (e.g. rename: old path A.ts is in deleted, files that import A.ts
@@ -150,12 +184,11 @@ export async function runIncrementalAnalyze(
     ...changeSet.added,
     ...changeSet.deleted,
   ];
-  console.time('[timing] findReverseDependencies');
+  logger.info({ projectId, count: changedFilesForDeps.length }, 'Finding reverse dependencies');
   const reverseDepResult = await findReverseDependencies(
     changedFilesForDeps, stores, projectId, 2,
   );
-  console.timeEnd('[timing] findReverseDependencies');
-  console.log(`[incremental] Reverse deps: ${reverseDepResult.reverseDeps.length} files`);
+  logger.info({ projectId, count: reverseDepResult.reverseDeps.length }, 'Reverse deps found');
 
   // P2-7 explosion guard: if filesToReparse > 50% of totalFiles, fall back to full rebuild
   const totalReparse = reverseDepResult.filesToReparse.size;
@@ -167,7 +200,7 @@ export async function runIncrementalAnalyze(
       );
       const totalFiles = (projectRows[0]?.totalFiles as number) || 0;
       if (totalFiles > 0 && totalReparse > totalFiles * 0.5) {
-        console.log(`[incremental] Explosion guard: ${totalReparse} files to reparse > 50% of ${totalFiles} total. Falling back to full rebuild.`);
+        logger.warn({ projectId, totalReparse, totalFiles }, 'Explosion guard: falling back to full rebuild');
         await stores.graph.query(
           `MATCH (p:Project {id: $projectId})
            SET p.fallbackCount = COALESCE(p.fallbackCount, 0) + 1,
@@ -184,7 +217,7 @@ export async function runIncrementalAnalyze(
         return { mode: 'full', ...stats, fallbackReason: `explosion_guard: ${totalReparse} > 0.5*${totalFiles}`, staleWikiEntities: await checkWikiFreshness(projectId, stores) };
       }
     } catch (err) {
-      console.warn(`[incremental] Explosion guard check failed (non-fatal, proceeding with incremental): ${err instanceof Error ? err.message : err}`);
+      logger.warn({ projectId, err }, 'Explosion guard check failed (non-fatal)');
     }
   }
 
@@ -202,9 +235,9 @@ export async function runIncrementalAnalyze(
     let nodeIds: string[] = [];
     try {
       nodeIds = await stores.graph.findNodeIdsByFilePath(projectId, filePath);
-      console.log(`[incremental] Found ${nodeIds.length} nodes for ${filePath}`);
+      logger.info({ projectId, filePath, count: nodeIds.length }, 'Found nodes for file');
     } catch (err) {
-      console.warn(`[incremental] Failed to find nodes for ${filePath}: ${err instanceof Error ? err.message : err}`);
+      logger.warn({ projectId, filePath, err }, 'Failed to find nodes for file');
     }
 
     // 6b. P1-T3: Soft-delete CODE_RELATION edges (SET valid_to, not DETACH DELETE)
@@ -222,10 +255,10 @@ export async function runIncrementalAnalyze(
            SET r.valid_to = $supersedeTime, r.txn_to = $txnTime`,
           { projectId, filePath, supersedeTime: now, txnTime: now },
         );
-        console.log(`[incremental] Neo4j: superseded CODE_RELATION edges for ${filePath}`);
+        logger.info({ projectId, filePath }, 'Neo4j: superseded CODE_RELATION edges');
       }
     } catch (err) {
-      console.warn(`[incremental] Failed to supersede graph edges for ${filePath}: ${err instanceof Error ? err.message : err}`);
+      logger.warn({ projectId, filePath, err }, 'Failed to supersede graph edges');
     }
 
     // 6b2. Delete associated Route and Tool nodes (P4: route/tool hybrid cleanup)
@@ -243,25 +276,61 @@ export async function runIncrementalAnalyze(
         { filePath, projectId },
       );
     } catch (err) {
-      console.warn(`[incremental] Failed to delete route/tool data for ${filePath}: ${err instanceof Error ? err.message : err}`);
+      logger.warn({ projectId, filePath, err }, 'Failed to delete route/tool data');
     }
 
     // 6c. Delete from Typesense (by filePath)
     try {
       const searchDeleted = await stores.search.deleteDocumentsByFilePath(projectId, filePath);
-      console.log(`[incremental] Typesense: deleted ${searchDeleted} docs for ${filePath}`);
+      logger.info({ projectId, filePath, count: searchDeleted }, 'Typesense docs deleted');
     } catch (err) {
-      console.warn(`[incremental] Failed to delete search data for ${filePath}: ${err instanceof Error ? err.message : err}`);
+      logger.warn({ projectId, filePath, err }, 'Failed to delete search data');
     }
 
     // 6d. Delete from Qdrant (by node IDs — uses pre-deletion IDs)
     try {
       if (nodeIds.length > 0) {
         const vectorDeleted = await stores.vector.deleteVectorsByNodeIds(projectId, nodeIds);
-        console.log(`[incremental] Qdrant: deleted ${vectorDeleted} vectors for ${filePath}`);
+        logger.info({ projectId, filePath, count: vectorDeleted }, 'Qdrant vectors deleted');
       }
     } catch (err) {
-      console.warn(`[incremental] Failed to delete vector data for ${filePath}: ${err instanceof Error ? err.message : err}`);
+      logger.warn({ projectId, filePath, err }, 'Failed to delete vector data');
+    }
+
+    // 6e. Mark nodes as stale in Neo4j (C3: stale marking was only half-done — add it here)
+    // This sets n.stale = true and n.staleAt = datetime() so queries can filter stale nodes.
+    try {
+      if (nodeIds.length > 0) {
+        const markResult = await stores.graph.query(
+          `MATCH (n) WHERE n.projectId = $projectId AND n.id IN $ids
+           SET n.stale = true, n.staleAt = datetime()`,
+          { projectId, ids: nodeIds },
+        );
+        logger.info({ projectId, filePath, count: nodeIds.length }, 'Nodes marked as stale');
+      }
+    } catch (err) {
+      logger.warn(`[incremental] Failed to mark stale for ${filePath}: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+
+  // 6f. Trigger stale cleanup asynchronously (C3: wire cleanup trigger)
+  // Collect all stale node IDs from the file loop and enqueue a cleanup job.
+  // The cleanup worker will asynchronously DETACH DELETE stale nodes.
+  const staleIds: string[] = [];
+  for (const filePath of filesToDelete) {
+    try {
+      const ids = await stores.graph.findNodeIdsByFilePath(projectId, filePath);
+      staleIds.push(...ids);
+    } catch (err) {
+      logger.warn({ projectId, filePath, err }, 'Failed to collect stale IDs for cleanup');
+    }
+  }
+  if (staleIds.length > 0) {
+    try {
+      await cleanupQueue.add('cleanup', { projectId, ids: staleIds });
+      logger.info({ projectId, count: staleIds.length }, 'Stale cleanup triggered');
+    } catch (err) {
+      logger.warn({ projectId, count: staleIds.length, err }, 'Failed to enqueue stale cleanup (non-fatal)');
     }
   }
 
@@ -272,7 +341,7 @@ export async function runIncrementalAnalyze(
     externalSymbolStore: stores.graph,
     projectId,
   };
-  console.log(`[incremental] Files to reparse: ${reverseDepResult.filesToReparse.size}`);
+  logger.info({ projectId, count: reverseDepResult.filesToReparse.size }, 'Files to reparse');
 
   let pipelineResult: PipelineResult;
   let fallbackReason: string | undefined;
@@ -285,15 +354,15 @@ export async function runIncrementalAnalyze(
   );
 
   try {
-    console.time('[timing] pipeline');
+    logger.info({ projectId }, '[timing] pipeline');
     pipelineResult = await effectiveRunner(localPath, options?.onProgress, pipelineOptions as Record<string, unknown>);
-    console.timeEnd('[timing] pipeline');
+    logger.info({ projectId }, '[timing] pipeline complete');
   } catch (err: unknown) {
     const errMsg = err instanceof Error ? err.message : String(err);
     // Use name check instead of instanceof — vitest ESM can create multiple
     // class instances where instanceof fails across module boundaries.
     if (err instanceof IncrementalFallbackError || (err as Error)?.name === 'IncrementalFallbackError') {
-      console.warn(`[incremental] Fallback to full: ${errMsg}`);
+      logger.warn({ projectId, error: errMsg }, 'Fallback to full rebuild');
       fallbackReason = errMsg;
       // Track fallback count, reason, and timestamp
       await stores.graph.query(
@@ -318,7 +387,7 @@ export async function runIncrementalAnalyze(
 
   // 8. Write results to all stores
   const headCommit = repoCache.getHeadCommit(localPath);
-  console.time('[timing] writePipelineResultToStores');
+  logger.info({ projectId }, '[timing] writePipelineResultToStores');
   const stats = await writePipelineResultToStores(
     pipelineResult,
     projectId,
@@ -327,18 +396,17 @@ export async function runIncrementalAnalyze(
     localPath,
     headCommit,
   );
-  console.timeEnd('[timing] writePipelineResultToStores');
+  logger.info({ projectId, nodeCount: stats.nodeCount, relationCount: stats.relationCount }, 'Stores written');
 
   // 9a. Temporal incremental: append new commits since last analysis
   let temporalFreshness = 'stale';
   try {
-    console.time('[timing] temporalStep');
+    logger.info({ projectId }, '[timing] temporalStep');
     await runTemporalStep(localPath, projectId, stores, options?.onProgress, changeSet.fromCommit);
-    console.timeEnd('[timing] temporalStep');
     temporalFreshness = 'partial'; // appended OK, but not a full temporal recalc
-    console.log(`[incremental] Temporal: appended commits since ${changeSet.fromCommit}`);
+    logger.info({ projectId, fromCommit: changeSet.fromCommit }, 'Temporal: commits appended');
   } catch (err) {
-    console.warn(`[incremental] Temporal incremental failed (non-fatal): ${err instanceof Error ? err.message : err}`);
+    logger.warn({ projectId, err }, 'Temporal incremental failed (non-fatal)');
   }
 
   // 9b. Community threshold check: rebuild if enough changes accumulated
@@ -356,22 +424,14 @@ export async function runIncrementalAnalyze(
       : Infinity;
 
     // Ratio-based threshold: max(50, totalFiles * 0.05) — scales with repo size
-    const COMMUNITY_CHANGE_MIN = 50;
-    const COMMUNITY_CHANGE_RATIO = 0.05;
-    const COMMUNITY_STALE_DAYS = 7;
     const totalFiles = (projectInfo[0]?.tfCount as number) || 0;
-    const COMMUNITY_CHANGE_THRESHOLD = Math.max(
-      COMMUNITY_CHANGE_MIN,
-      Math.floor(Math.max(totalFiles, 1) * COMMUNITY_CHANGE_RATIO),
-    );
+    const COMMUNITY_CHANGE_THRESHOLD = computeCommunityThreshold(totalFiles);
 
     const shouldRebuild = accumulatedChanges >= COMMUNITY_CHANGE_THRESHOLD || daysSinceCommunityRebuild >= COMMUNITY_STALE_DAYS;
 
     if (shouldRebuild) {
-      console.log(`[incremental] Rebuilding communities (accumulated=${accumulatedChanges}, threshold=${COMMUNITY_CHANGE_THRESHOLD}, days=${daysSinceCommunityRebuild.toFixed(1)})`);
-      console.time('[timing] rebuildCommunities');
+      logger.info({ projectId, accumulatedChanges, threshold: COMMUNITY_CHANGE_THRESHOLD, daysSinceCommunityRebuild: daysSinceCommunityRebuild.toFixed(1) }, 'Rebuilding communities');
       await rebuildCommunities(stores, projectId, pipelineResult);
-      console.timeEnd('[timing] rebuildCommunities');
       communityRecalculated = true;
     } else {
       // Mark stale and track accumulated changes
@@ -382,8 +442,8 @@ export async function runIncrementalAnalyze(
         { projectId, ac: accumulatedChanges },
       );
     }
-  } catch (err) {
-    console.warn(`[incremental] Community check failed (non-fatal): ${err instanceof Error ? err.message : err}`);
+    } catch (err) {
+    logger.warn({ projectId, err }, 'Community check failed (non-fatal)');
     // On error, conservatively mark communities as stale
     await stores.graph.query(
       `MATCH (p:Project {id: $projectId})
@@ -408,7 +468,62 @@ export async function runIncrementalAnalyze(
     { projectId, communityRecalculated, temporalFreshness, duration: incrementalDurationMs },
   );
 
-  console.log(`[incremental] Incremental analysis complete: ${stats.nodeCount} nodes, ${stats.relationCount} relations`);
+  logger.info({ projectId, nodeCount: stats.nodeCount, relationCount: stats.relationCount }, 'Incremental analysis complete');
+
+  // v1.4.0: Incremental auto-derivation for changed files (async dispatch by default)
+  if (options?.wikiService) {
+    try {
+      const { loadRulesWithFallback } = await import('../wiki/derivation-rules.js');
+      const { CodeEntitySelector } = await import('../wiki/code-entity-selector.js');
+      const { fileURLToPath } = await import('url');
+
+      const defaultRulesPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'config', 'derivation-rules.json');
+      const rules = loadRulesWithFallback(localPath, defaultRulesPath);
+
+      const selector = new CodeEntitySelector(rules, stores.graph);
+      const changedFiles = [...reverseDepResult.filesToReparse];
+      const nodes = await selector.selectNodesForChanges(projectId, changedFiles);
+
+      if (nodes.length > 0 && rules.enabled !== false) {
+        if (options.syncDerivation) {
+          // Legacy sync path (for tests with mocked LLM)
+          const { WikiDerivationEngine } = await import('../wiki/derivation-engine.js');
+          const engine = new WikiDerivationEngine(
+            options.wikiService,
+            options.llmClient ?? stores.llm,
+            rules,
+          );
+          const deriveResult = await engine.deriveEntities(projectId, nodes);
+          logger.info(
+            { projectId, derived: deriveResult.derived, skipped: deriveResult.skipped, mode: 'sync' },
+            'Incremental wiki derivation (sync mode)',
+          );
+        } else {
+          // v1.4.0: Async dispatch (production path)
+          const { JobDispatcher } = await import('./resilience/job-dispatcher.js');
+          const { llmDerivationQueue } = await import('./queue-setup.js');
+          const dispatcher = new JobDispatcher();
+          const batchSize = rules.dispatchBatchSize ?? 10;
+          const lastCommitForJobId = (project?.lastCommit as string | undefined) ?? 'nogit';
+          const dispatchResult = await dispatcher.dispatch(
+            llmDerivationQueue,
+            nodes,
+            (batch) => ({ projectId, nodes: batch.map(n => n.id) }),
+            { batchSize, jobIdPrefix: `derive-incr-${projectId}-${lastCommitForJobId}` },
+          );
+          logger.info(
+            { projectId, batches: dispatchResult.batches, nodes: dispatchResult.dispatched, mode: 'async' },
+            'Incremental wiki derivation dispatched',
+          );
+        }
+      }
+    } catch (err) {
+      logger.warn(
+        { projectId, error: err instanceof Error ? err.message : String(err) },
+        'Incremental wiki auto-derivation failed (non-fatal)',
+      );
+    }
+  }
 
   const staleWikiEntities = await checkWikiFreshness(projectId, stores);
 
@@ -461,13 +576,13 @@ async function checkWikiFreshness(projectId: string, stores: StoreSet): Promise<
     }
 
     if (staleEntities.length > 0) {
-      console.log(`[incremental] Wiki freshness: ${staleEntities.length}/${entities.length} entities need attention`);
+      logger.info({ projectId, staleCount: staleEntities.length, total: entities.length }, 'Wiki entities need attention');
     }
 
     return staleEntities;
   } catch (err) {
     // Freshness check is non-fatal — log and return empty array
-    console.warn(`[incremental] Wiki freshness check failed (non-fatal): ${err instanceof Error ? err.message : err}`);
+    logger.warn({ projectId, err }, 'Wiki freshness check failed (non-fatal)');
     return [];
   }
 }

@@ -10,9 +10,10 @@ import { z } from 'zod';
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { StoreSet } from '../../store/interfaces.js';
 import type { RepoCacheManager } from '../../core/repo-cache.js';
+import type { TaskManager } from '../../task/index.js';
 import { runIncrementalAnalyze } from '../../core/run-incremental.js';
 
-export function registerIncrementalAnalyze(server: McpServer, stores: StoreSet, repoCache: RepoCacheManager): void {
+export function registerIncrementalAnalyze(server: McpServer, stores: StoreSet, repoCache: RepoCacheManager, taskManager?: TaskManager): void {
   server.registerTool(
     'incremental_analyze',
     {
@@ -25,9 +26,35 @@ export function registerIncrementalAnalyze(server: McpServer, stores: StoreSet, 
     async ({ projectId }) => {
       console.log(`[mcp:incremental_analyze] Starting: projectId=${projectId}`);
 
-      // Fire-and-forget — analysis can take minutes for large repos
+      // De-duplication: check TaskManager before starting
+      if (taskManager) {
+        const state = taskManager.getState(projectId);
+        if (state?.status === 'analyzing' || state?.status === 'queued') {
+          return {
+            content: [
+              {
+                type: 'text' as const,
+                text: JSON.stringify({
+                  status: 'already_queued',
+                  projectId,
+                  currentStatus: state.status,
+                  hint: 'Project is already being analyzed. Use list_repos to check progress.',
+                }, null, 2),
+              },
+            ],
+          };
+        }
+      }
+
+      // Fire-and-forget — analysis can take minutes for large repos (MCP SDK 60s timeout)
       setImmediate(async () => {
         try {
+          // Submit via TaskManager for state tracking (minimal options — repo already cloned)
+          if (taskManager) {
+            await taskManager.requestAnalyze(projectId, {}).catch((err: unknown) => {
+              console.warn(`[mcp:incremental_analyze] TaskManager state error: ${err instanceof Error ? err.message : String(err)}`);
+            });
+          }
           const result = await runIncrementalAnalyze(projectId, stores, repoCache);
           console.log(
             `[mcp:incremental_analyze] Completed: ${projectId} — mode=${result.mode}, ` +

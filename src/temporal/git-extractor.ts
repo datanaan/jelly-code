@@ -9,7 +9,7 @@ import { execSync } from "child_process";
 import type { CommitData, GitExtractOptions } from "./types.js";
 import { parseGitLogOutput } from "./commit-parser.js";
 
-const DEFAULT_MAX_COMMITS = 10000;
+const DEFAULT_MAX_COMMITS = parseInt(process.env.MAX_COMMITS || '10000', 10);
 const GIT_TIMEOUT_MS = 300000; // 5 minutes
 
 /**

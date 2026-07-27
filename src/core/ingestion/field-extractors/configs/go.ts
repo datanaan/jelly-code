@@ -1,4 +1,4 @@
-// field-extractors/configs/go.ts
+// src/core/ingestion/field-extractors/configs/go.ts
 
 import { SupportedLanguages } from '@shared';
 import type { FieldExtractionConfig } from '../generic.js';

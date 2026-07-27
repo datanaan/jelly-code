@@ -2,7 +2,7 @@
  * Type declarations for the ingestion pipeline module.
  *
  * The ingestion code is excluded from TypeScript compilation due to
- * strict mode incompatibilities in the ingestion pipeline. This declaration
+ * strict mode incompatibilities from the jelly-code source. This declaration
  * file provides the types needed by the main project.
  *
  * IMPORTANT: Do not add any `import` statements here — they cause TypeScript

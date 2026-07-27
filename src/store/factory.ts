@@ -1,29 +1,33 @@
-import type { StoreSet, IGraphStore, ISearchStore, IVectorStore } from './interfaces.js';
+import type { StoreSet } from './interfaces.js';
 import { Neo4jAdapter } from './neo4j/adapter.js';
 import { TypesenseAdapter } from './typesense/adapter.js';
 import { QdrantAdapter } from './qdrant/adapter.js';
-import { OllamaAdapter } from '../llm/ollama.js';
-import { OpenAIAdapter } from '../llm/openai.js';
-import { FallbackLLMClient } from '../llm/fallback.js';
+import { LLMService } from '../llm/llm-service.js';
 import type { ILLMClient } from '../llm/interface.js';
 import type { AppConfig } from '../config/index.js';
+import { validateRemoteServiceConfig } from '../core/resilience/index.js';
+import { logger } from '../core/logger.js';
 
 /**
  * Create a StoreSet based on the application configuration.
- * LLM: primary (cloud API) → fallback (local Ollama)
+ * v1.4.0: LLM via LLMService (RemoteService + cockatiel + p-limit + undici)
  */
 export function createStoreSet(config: AppConfig): StoreSet {
-  let llm: ILLMClient;
-
-  if (config.llmPrimary) {
-    const primary = new OpenAIAdapter(config.llmPrimary);
-    const fallback = new OllamaAdapter(config.llm);
-    llm = new FallbackLLMClient(primary, fallback);
-    console.log('[factory] LLM: primary=', config.llmPrimary.model, 'fallback=', config.llm.model);
-  } else {
-    llm = new OllamaAdapter(config.llm);
-    console.log('[factory] LLM: ollama-only, model=', config.llm.model);
+  const llmConfig = {
+    name: 'llm' as const,
+    endpoints: (config.llmPool?.endpoints ?? [{ url: config.llm.baseUrl, model: config.llm.model }]) as any,
+    strategy: config.llmPool?.strategy ?? 'priority',
+    resilience: config.llmPool?.resilience ?? {
+      maxConcurrency: 4, timeoutMs: 60000, retryAttempts: 2, retryBackoffMs: 1000,
+      circuitFailureThreshold: 5, circuitResetMs: 30000,
+    },
+  };
+  const errors = validateRemoteServiceConfig(llmConfig);
+  if (errors.length > 0) {
+    throw new Error(`LLM config invalid: ${errors.join('; ')}`);
   }
+  const llm: ILLMClient = new LLMService(llmConfig);
+  logger.info({ strategy: llmConfig.strategy, endpointCount: llmConfig.endpoints.length }, '[factory] LLM pool initialized');
 
   return {
     graph: new Neo4jAdapter(config.neo4j),

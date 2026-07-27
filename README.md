@@ -10,9 +10,9 @@
 
 ## What is jelly-code?
 
-jelly-code turns your source code into a **queryable knowledge graph** — not just text search, but real semantic understanding of symbols, imports, inheritance, call chains, API routes, and code evolution over time.
+jelly-code turns source code into a **queryable knowledge graph** — not text search, but real semantic understanding: symbols, imports, inheritance, call chains, API routes, and code evolution over time.
 
-It exposes **33+ MCP tools** so AI assistants (Claude Code, Cursor, Windsurf, etc.) can understand and navigate your codebase without manual context loading.
+It exposes **33+ MCP tools** so AI assistants (Claude Code, Cursor, Windsurf, etc.) can navigate your codebase without manual context loading.
 
 ### What makes it different?
 
@@ -20,9 +20,31 @@ It exposes **33+ MCP tools** so AI assistants (Claude Code, Cursor, Windsurf, et
 | --- | --- |
 | Grep / full-text search | Semantic symbol graph + structured queries |
 | Manual code review | Automated API analysis, dependency mapping, impact analysis |
-| Context window limits | On-demand code queries via MCP — only load what you need |
-| Static docs that go stale | Live Wiki that syncs with your code |
+| Context window limits | On-demand code queries via MCP — load only what you need |
+| Hand-written docs that go stale | **Auto-discovered Wiki** — finds docs in your repo, tracks freshness |
+| Static git log only | **Code time travel** — snapshot any point in history, narrated evolution |
 | Single-language tools | 14 languages, one unified graph |
+
+---
+
+## ✨ Key Innovations
+
+### 📖 Self-Discovering Documentation Wiki
+
+Most tools need you to **tell them where the docs are**. jelly-code does the opposite — it **finds documentation automatically**.
+
+- **Auto-discovery**: Scans your repo for READMEs, architecture docs, API references, inline docs — zero config
+- **Freshness tracking**: Every indexed page gets a cryptographic signature. When code changes, jelly-code flags stale docs instantly
+- **Entity cross-reference**: Maps code entities (classes, functions, APIs) to their documentation
+- **Live lint**: Detects broken cross-references, orphaned pages, missing coverage — all automated
+
+### ⏳ Code Time Travel
+
+jelly-code lets you travel through your code's full history.
+
+- **Snapshot any point in time**: See what any symbol or API looked like at any commit
+- **Evolution narrative**: Ask "how did this function evolve?" and get a natural-language story
+- **Change traceability**: From a bug report to the exact commit that introduced it
 
 ---
 
@@ -34,29 +56,31 @@ It exposes **33+ MCP tools** so AI assistants (Claude Code, Cursor, Windsurf, et
 # Index your project
 npx jelly-code analyze /path/to/your-project
 
-# Query what it found
+# Ask questions about the code
 npx jelly-code query "find all API routes"
 npx jelly-code query "which files import from auth.ts?"
-npx jelly-code query "show me the inheritance hierarchy"
 ```
 
-### 🤖 AI Agent — Ask questions naturally
-
-Connect jelly-code's MCP server to any MCP-compatible AI client:
+### 🤖 AI Agent — Query via MCP
 
 ```
-# "What does the handleRequest function do?"
-# "Show me the call chain from login() to database write"
-# "Which files would be affected if I change the User model?"
-# "Map all HTTP routes and their response types"
-# "Compare this file to how it looked 10 commits ago"
+# 🔍 Code understanding
+"What does the handleRequest function do?"
+"Show me the call chain from login() to database write"
+"Which files would be affected if I change the User model?"
+
+# 📖 Wiki
+"Find all documentation in this repo and check which pages are stale"
+"Which code entities are missing documentation?"
+
+# ⏳ Temporal
+"What did the payment service look like 30 commits ago?"
+"Tell me the story of how the SearchEngine class evolved"
 ```
 
 ---
 
 ## 33+ MCP Tools
-
-jelly-code exposes a rich set of tools for AI agents. They fall into six categories:
 
 ### 🔍 Code Analysis (9 tools)
 
@@ -91,32 +115,39 @@ jelly-code exposes a rich set of tools for AI agents. They fall into six categor
 | `api_impact` | Estimate which consumers break on API change |
 | `api_stability` | Assess endpoint stability from change history |
 
-### 📖 Wiki (8 tools)
+### 📖 Wiki — Auto-Discovered Documentation (8 tools)
 
 | Tool | What it does |
 | --- | --- |
 | `wiki_ingest` | Index a documentation page |
 | `wiki_batch_ingest` | Bulk index multiple pages |
-| `wiki_query` | Search indexed Wiki content |
+| `wiki_query` | Search indexed wiki content |
 | `wiki_auto_discover` | Automatically find docs in the repo |
-| `wiki_status` | Check wiki freshness |
-| `wiki_lint` | Detect broken cross-references |
+| `wiki_status` | Check wiki freshness (signature-based staleness detection) |
+| `wiki_lint` | Detect broken cross-references, orphaned pages, missing coverage |
 | `wiki_sync` | Resync stale pages |
-| `wiki_entity_freshness` | Check if code entities are up-to-date with docs |
+| `wiki_entity_freshness` | Check if code entities are up-to-date with their docs |
 
-### ⏳ Temporal (2 tools)
+### ⏳ Temporal — Code Time Travel (3 tools)
 
 | Tool | What it does |
 | --- | --- |
-| `code_as_of` | View code state at any point in history |
-| `code_evolution_story` | Narrative of how a symbol/API evolved |
+| `code_as_of` | Snapshot code at any point in history |
+| `code_evolution_story` | Narrative of how a symbol/API changed over time |
+| `changes_between` | Diff between two commits — node-level + project-level |
 
-### 🛠️ Project (2 tools)
+### 🛠️ Project & Intelligence (8 tools)
 
 | Tool | What it does |
 | --- | --- |
 | `list_repos` | List all indexed repositories |
 | `project_status` | Health and freshness of a project |
+| `find_dead_code` | Find unreferenced code symbols |
+| `list_dependencies` | List external + internal dependencies |
+| `affected_tests` | Find test files affected by code changes |
+| `route_map` | Show API route mappings + consumers |
+| `tool_map` | Show MCP/RPC tool definitions |
+| `shape_check` | Check API response shapes vs consumer access |
 
 ---
 
@@ -130,9 +161,9 @@ jelly-code exposes a rich set of tools for AI agents. They fall into six categor
 ### 1. Install
 
 ```bash
-git clone https://github.com/<your-org>/jelly-code
+git clone https://github.com/datanaan/jelly-code
 cd jelly-code
-npm ci
+npm install
 npm run build
 ```
 
@@ -157,7 +188,7 @@ npx jelly-code analyze /path/to/your-project
 npx jelly-code mcp
 ```
 
-Now connect any MCP client (`claude mcp add`, Cursor, etc.) to `http://localhost:8095/mcp`.
+Now connect any MCP client to `http://localhost:8095/mcp`.
 
 ---
 
@@ -184,34 +215,15 @@ Now connect any MCP client (`claude mcp add`, Cursor, etc.) to `http://localhost
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────┐
-│             AI Client                        │
-│   (Claude Code · Cursor · Windsurf · etc.)  │
-└───────────────────┬─────────────────────────┘
-                    │ MCP Protocol (HTTP/SSE)
-                    ▼
-┌─────────────────────────────────────────────┐
-│              MCP Server (Express)            │
-│   ┌──────┐ ┌──────┐ ┌──────┐ ┌──────────┐  │
-│   │Code  │ │Graph │ │API   │ │Wiki      │  │
-│   │Tools │ │Tools │ │Tools │ │Tools     │  │
-│   └──┬───┘ └──┬───┘ └──┬───┘ └────┬─────┘  │
-│      └────────┼────────┼───────────┘         │
-└───────────────┼────────┼─────────────────────┘
-                │        │
-    ┌───────────▼────────▼───────────────────┐
-    │        Ingestion Pipeline               │
-    │  Scan → Tree-sitter Parse → Resolve →  │
-    │  Community Detection → Process Extract  │
-    └───────────┬────────┬───────────────────┘
-                │        │
-    ┌───────────▼────────▼───────────────────┐
-    │     Storage Layer                       │
-    │  ┌──────┐  ┌────────┐  ┌──────────┐    │
-    │  │Neo4j │  │Typesense│  │ Qdrant   │    │
-    │  │Graph │  │Search  │  │ Vector   │    │
-    │  └──────┘  └────────┘  └──────────┘    │
-    └─────────────────────────────────────────┘
+AI Client ── MCP Protocol ──▶ MCP Server (Express)
+                                   │
+                          Ingestion Pipeline
+                       Scan → Parse → Resolve → Enrich
+                                   │
+                    ┌──────────────┼──────────────┐
+                    ▼              ▼              ▼
+                  Neo4j        Typesense       Qdrant
+                 (Graph)      (Full-text)     (Vector)
 ```
 
 ### Pipeline phases
@@ -220,6 +232,11 @@ Now connect any MCP client (`claude mcp add`, Cursor, etc.) to `http://localhost
 2. **Parse** — Tree-sitter AST parsing per language
 3. **Resolve** — Imports, calls, heritage, route detection
 4. **Enrich** — Community detection (Leiden), process extraction, cross-file type propagation
+
+### Dual Deployment Mode
+
+- **Standalone mode** (`DEPLOY_MODE=standalone`) — independent API key auth, unlimited quota, no external dependencies
+- **Jelly mode** (`DEPLOY_MODE=jelly`) — integrates with Jelly platform for auth/billing/routing
 
 ---
 
@@ -230,31 +247,40 @@ Key environment variables:
 | Variable | Default | Description |
 | --- | --- | --- |
 | `PORT` | `8095` | HTTP server port |
+| `DEPLOY_MODE` | `standalone` | `standalone` or `jelly` |
 | `NEO4J_URI` | `bolt://localhost:7687` | Neo4j connection URI |
 | `NEO4J_USER` | `neo4j` | Neo4j username |
 | `NEO4J_PASSWORD` | — | Neo4j password |
 | `TYPESENSE_API_KEY` | — | Typesense API key |
 | `TYPESENSE_HOST` | `localhost` | Typesense host |
 | `TYPESENSE_PORT` | `8108` | Typesense port |
-| `QDRANT_HOST` | — | Qdrant host (optional) |
+| `QDRANT_URL` | `http://localhost:6333` | Qdrant URL (optional) |
+| `STANDALONE_API_KEYS` | — | Comma-separated API keys (standalone mode) |
 | `CODE_EMBEDDING_URL` | — | HTTP embedding API URL |
-| `CODE_EMBEDDING_MODEL` | — | Embedding model name |
+
+### Resilience Layer (v1.3.1)
+
+LLM and Embedding calls go through a unified `RemoteService`:
+
+- **Multi-endpoint pool**: `LLM_ENDPOINTS_JSON` / `CODE_EMBEDDING_URLS`
+- **Load balancing**: priority, round-robin, weighted-random, least-connections
+- **Circuit breaker**: cockatiel CircuitBreaker with configurable thresholds
+- **Async queues**: Derivation tasks through BullMQ, non-blocking pipeline
+- **Observability**: `/health/llm`, `/health/embedding`, `/health/queues`, `/readyz`, `/metrics`
 
 ---
 
-## Roadmap
+## Development
 
-- [ ] File watcher — real-time incremental updates
-- [ ] Web UI — graph visualization dashboard
-- [ ] GitHub App — auto-index on push
-- [ ] Monorepo-native — workspace-aware analysis
-- [ ] More languages — add community grammar support
-- [ ] LLM-enhanced description extraction
+```bash
+npm run build       # Compile TypeScript
+npm run lint        # Type check (tsc --noEmit)
+npm test            # Run unit tests
+npm run test:watch  # Run tests in watch mode
+```
 
 ---
 
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE).
-
-> **Name disclaimer:** "jelly-code" is an independent open-source project. It is not affiliated with, endorsed by, or related to any other project or organization using the "jelly" name.

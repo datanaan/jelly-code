@@ -53,6 +53,14 @@ function deserializeCodeSignature(
 export class WikiGraph {
   constructor(private graph: IGraphStore) {}
 
+  /**
+   * Execute a raw Cypher query against the underlying graph store.
+   * Used by WikiService for ad-hoc queries (log TTL cleanup, content hash checks, etc.).
+   */
+  async query(cypher: string, params?: Record<string, unknown>): Promise<Record<string, unknown>[]> {
+    return this.graph.query(cypher, params ?? {});
+  }
+
   // ==========================================
   // Source CRUD
   // ==========================================
@@ -65,7 +73,9 @@ export class WikiGraph {
            s.summary = $summary,
            s.key_points = $keyPoints,
            s.compiled_at = $compiledAt,
-           s.projectId = $projectId`,
+           s.projectId = $projectId,
+           s.content_hash = $contentHash,
+           s.llm_output_hash = $llmOutputHash`,
       {
         id: source.id,
         projectId: source.projectId,
@@ -74,6 +84,8 @@ export class WikiGraph {
         summary: source.summary,
         keyPoints: source.keyPoints,
         compiledAt: source.compiledAt,
+        contentHash: source.contentHash ?? null,
+        llmOutputHash: source.llmOutputHash ?? null,
       },
     );
   }
@@ -142,6 +154,8 @@ export class WikiGraph {
            e.first_compiled = $firstCompiled,
            e.last_updated = $lastUpdated,
            e.codeSignature = $codeSignature,
+           e.provenance = $provenance,
+           e.derived_at = $derivedAt,
            e.projectId = $projectId`,
       {
         id: entity.id,
@@ -155,6 +169,8 @@ export class WikiGraph {
         codeSignature: entity.codeSignature
           ? JSON.stringify(entity.codeSignature)
           : null,
+        provenance: entity.provenance ?? null,
+        derivedAt: entity.derivedAt ?? null,
       },
     );
   }
@@ -189,6 +205,15 @@ export class WikiGraph {
         ? JSON.stringify(updates.codeSignature)
         : null;
     }
+    // v1.3.0 Phase 1 T1-5: provenance/derivedAt updates
+    if (updates.provenance !== undefined) {
+      setClauses.push('e.provenance = $provenance');
+      params.provenance = updates.provenance;
+    }
+    if (updates.derivedAt !== undefined) {
+      setClauses.push('e.derived_at = $derivedAt');
+      params.derivedAt = updates.derivedAt;
+    }
 
     if (setClauses.length === 0) return;
 
@@ -205,7 +230,8 @@ export class WikiGraph {
        RETURN e.id AS id, e.projectId AS projectId, e.name AS name, e.entity_type AS entityType,
               e.definition AS definition, e.details AS details,
               e.first_compiled AS firstCompiled, e.last_updated AS lastUpdated,
-              e.codeSignature AS codeSignature`,
+              e.codeSignature AS codeSignature,
+              e.provenance AS provenance, e.derived_at AS derivedAt`,
       { id: entityId, projectId },
     );
     if (rows.length === 0) return null;
@@ -220,6 +246,8 @@ export class WikiGraph {
       firstCompiled: r.firstCompiled as string,
       lastUpdated: r.lastUpdated as string,
       codeSignature: deserializeCodeSignature(r.codeSignature),
+      provenance: (r.provenance as WikiEntity['provenance']) ?? undefined,
+      derivedAt: (r.derivedAt as string) ?? undefined,
     };
   }
 
@@ -229,7 +257,8 @@ export class WikiGraph {
        RETURN e.id AS id, e.projectId AS projectId, e.name AS name, e.entity_type AS entityType,
               e.definition AS definition, e.details AS details,
               e.first_compiled AS firstCompiled, e.last_updated AS lastUpdated,
-              e.codeSignature AS codeSignature`,
+              e.codeSignature AS codeSignature,
+              e.provenance AS provenance, e.derived_at AS derivedAt`,
       { projectId, name },
     );
     if (rows.length === 0) return null;
@@ -244,6 +273,8 @@ export class WikiGraph {
       firstCompiled: r.firstCompiled as string,
       lastUpdated: r.lastUpdated as string,
       codeSignature: deserializeCodeSignature(r.codeSignature),
+      provenance: (r.provenance as WikiEntity['provenance']) ?? undefined,
+      derivedAt: (r.derivedAt as string) ?? undefined,
     };
   }
 
@@ -259,7 +290,8 @@ export class WikiGraph {
     cypher += ` RETURN e.id AS id, e.projectId AS projectId, e.name AS name, e.entity_type AS entityType,
                         e.definition AS definition, e.details AS details,
                         e.first_compiled AS firstCompiled, e.last_updated AS lastUpdated,
-                        e.codeSignature AS codeSignature
+                        e.codeSignature AS codeSignature,
+                        e.provenance AS provenance, e.derived_at AS derivedAt
                ORDER BY e.name`;
 
     const rows = await this.graph.query(cypher, params);
@@ -273,6 +305,8 @@ export class WikiGraph {
       firstCompiled: r.firstCompiled as string,
       lastUpdated: r.lastUpdated as string,
       codeSignature: deserializeCodeSignature(r.codeSignature),
+      provenance: (r.provenance as WikiEntity['provenance']) ?? undefined,
+      derivedAt: (r.derivedAt as string) ?? undefined,
     }));
   }
 
@@ -282,6 +316,95 @@ export class WikiGraph {
        DETACH DELETE e`,
       { id: entityId, projectId },
     );
+  }
+
+  // ==========================================
+  // v1.3.0 Phase 2: Auto-fix helpers
+  // ==========================================
+
+  /**
+   * List WikiEntities filtered by provenance.
+   * Used by wiki_auto_fix undo-auto-derived to find all auto-derived entities.
+   */
+  async listEntitiesByProvenance(
+    projectId: string,
+    provenance: 'auto-derived' | 'manual' | 'human-verified',
+  ): Promise<Array<{ id: string; name: string; provenance?: string }>> {
+    const rows = await this.graph.query(
+      `MATCH (e:WikiEntity)
+       WHERE e.projectId = $projectId AND e.provenance = $provenance
+       RETURN e.id AS id, e.name AS name, e.provenance AS provenance
+       ORDER BY e.name`,
+      { projectId, provenance },
+    );
+    return rows.map(r => ({
+      id: r.id as string,
+      name: r.name as string,
+      provenance: (r.provenance as string) ?? undefined,
+    }));
+  }
+
+  /**
+   * Find WikiEntities whose active DESCRIBES edges point to CodeNodes
+   * that no longer exist in the graph.
+   *
+   * An entity is "orphaned" when:
+   *   1. It has an active DESCRIBES edge (valid_to IS NULL)
+   *   2. The target CodeNode of that edge doesn't exist
+   *      (deleted during incremental analysis)
+   *
+   * Also finds auto-derived entities that have NO active DESCRIBES edges
+   * at all (CodeNode was fully deleted + edge was closed/superseded).
+   */
+  async findOrphanedEntities(
+    projectId: string,
+  ): Promise<Array<{ id: string; name: string; provenance?: string; reason: string }>> {
+    // Strategy: find auto-derived entities that either:
+    //   A) Have an active DESCRIBES edge to a node that doesn't exist as a CodeNode
+    //   B) Have no active DESCRIBES edges at all (orphaned after full CodeNode deletion)
+
+    // Part A: active DESCRIBES edges pointing to non-existent targets
+    const danglingRows = await this.graph.query(
+      `MATCH (e:WikiEntity {projectId: $projectId})-[d:DESCRIBES {projectId: $projectId}]->(c)
+       WHERE d.valid_to IS NULL
+         AND NOT EXISTS {
+           MATCH (codeNode {id: c.id, projectId: $projectId})
+           WHERE codeNode:Function OR codeNode:Class OR codeNode:Method
+              OR codeNode:File OR codeNode:CodeElement
+         }
+       RETURN DISTINCT e.id AS id, e.name AS name,
+              e.provenance AS provenance, 'dangling-edge' AS reason`,
+      { projectId },
+    );
+
+    // Part B: auto-derived entities with no active DESCRIBES edges
+    const noEdgeRows = await this.graph.query(
+      `MATCH (e:WikiEntity {projectId: $projectId, provenance: 'auto-derived'})
+       WHERE NOT EXISTS {
+         MATCH (e)-[d:DESCRIBES {projectId: $projectId}]->()
+         WHERE d.valid_to IS NULL
+       }
+       RETURN DISTINCT e.id AS id, e.name AS name,
+              e.provenance AS provenance, 'no-active-edge' AS reason`,
+      { projectId },
+    );
+
+    const dangling = danglingRows.map(r => ({
+      id: r.id as string,
+      name: r.name as string,
+      provenance: (r.provenance as string) ?? undefined,
+      reason: r.reason as string,
+    }));
+    const noEdge = noEdgeRows.map(r => ({
+      id: r.id as string,
+      name: r.name as string,
+      provenance: (r.provenance as string) ?? undefined,
+      reason: r.reason as string,
+    }));
+
+    // Deduplicate by entity id (dangling takes priority)
+    const seen = new Set(dangling.map(e => e.id));
+    return [...dangling, ...noEdge.filter(e => !seen.has(e.id))];
   }
 
   // ==========================================
@@ -337,6 +460,141 @@ export class WikiGraph {
       { id: entityId, projectId },
     );
     return rows.map(r => r.id as string);
+  }
+
+  // ==========================================
+  // Cross-domain edges (WikiEntity ↔ CodeNode) — v1.3.0 Phase 1
+  // ==========================================
+
+  /**
+   * v1.3.0 Phase 1 T1-2: Create bidirectional cross-domain edges between
+   * a WikiEntity and a CodeNode.
+   *
+   * Creates:
+   *   (e:WikiEntity)-[:DESCRIBES]->(c:CodeNode)
+   *   (c:CodeNode)-[:DOCUMENTED_BY]->(e:WikiEntity)
+   *
+   * Both edges carry bi-temporal properties aligned with CODE_RELATION:
+   *   - valid_from: when this wiki↔code link became valid (set once, ON CREATE)
+   *   - txn_from:   transaction time of edge creation (set once, ON CREATE)
+   *   - commitId:   optional commit that triggered the binding
+   *
+   * MERGE + ON CREATE ensures idempotency: re-binding the same pair does NOT
+   * reset valid_from — the original binding time is preserved. Subsequent
+   * supersede of the CodeNode (Phase 1 T1-6) sets valid_to/txn_to, marking
+   * the edge as historically superseded.
+   *
+   * @param projectId - Project scope for isolation
+   * @param entityId  - WikiEntity.id
+   * @param codeNodeId - CodeNode.id (the actual Neo4j node id, not symbol name)
+   * @param commitId  - Optional commit hash that triggered this binding
+   */
+  async createCrossDomainEdges(
+    projectId: string,
+    entityId: string,
+    codeNodeId: string,
+    commitId?: string,
+  ): Promise<void> {
+    await this.graph.query(
+      `MATCH (e:WikiEntity {id: $entityId, projectId: $projectId})
+       MATCH (c {id: $codeNodeId, projectId: $projectId})
+       MERGE (e)-[d:DESCRIBES {projectId: $projectId}]->(c)
+         ON CREATE SET d.valid_from = datetime(),
+                       d.txn_from   = datetime(),
+                       d.commitId   = $commitId
+       MERGE (c)-[db:DOCUMENTED_BY {projectId: $projectId}]->(e)
+         ON CREATE SET db.valid_from = datetime(),
+                       db.txn_from   = datetime(),
+                       db.commitId   = $commitId`,
+      { projectId, entityId, codeNodeId, commitId: commitId ?? null },
+    );
+  }
+
+  /**
+   * v1.3.0 Phase 1 T1-4: Find all CodeNodes documented by a WikiEntity.
+   *
+   * Traverses (e:WikiEntity)-[:DESCRIBES]->(c) edges.
+   * Optionally filters to only currently-active edges (valid_to IS NULL),
+   * excluding edges that were superseded when a CodeNode was replaced.
+   *
+   * @returns Array of { id, name, type, filePath } for each documented CodeNode
+   */
+  async findDocumentedCodeNodes(
+    projectId: string,
+    entityId: string,
+    activeOnly: boolean = true,
+  ): Promise<Array<{ id: string; name: string; type: string; filePath: string }>> {
+    const validFilter = activeOnly ? 'AND d.valid_to IS NULL' : '';
+    const rows = await this.graph.query(
+      `MATCH (e:WikiEntity {id: $entityId, projectId: $projectId})
+       MATCH (e)-[d:DESCRIBES {projectId: $projectId}]->(c)
+       WHERE 1=1 ${validFilter}
+       RETURN c.id AS id, c.name AS name, c.type AS type, c.filePath AS filePath`,
+      { projectId, entityId },
+    );
+    return rows.map(r => ({
+      id: r.id as string,
+      name: r.name as string,
+      type: r.type as string,
+      filePath: r.filePath as string,
+    }));
+  }
+
+  /**
+   * v1.3.0 Phase 1 T1-4: Find all WikiEntities that document a CodeNode.
+   *
+   * Traverses (c:CodeNode)-[:DOCUMENTED_BY]->(e:WikiEntity) edges
+   * (equivalently (e)-[:DESCRIBES]->(c) in the reverse direction).
+   *
+   * Optionally filters to only currently-active edges (valid_to IS NULL).
+   *
+   * @returns Array of { id, name, entityType } for each documenting WikiEntity
+   */
+  async findDocumentingEntities(
+    projectId: string,
+    codeNodeId: string,
+    activeOnly: boolean = true,
+  ): Promise<Array<{ id: string; name: string; entityType: EntityType }>> {
+    const validFilter = activeOnly ? 'AND db.valid_to IS NULL' : '';
+    const rows = await this.graph.query(
+      `MATCH (c {id: $codeNodeId, projectId: $projectId})
+       MATCH (c)-[db:DOCUMENTED_BY {projectId: $projectId}]->(e:WikiEntity)
+       WHERE 1=1 ${validFilter}
+       RETURN e.id AS id, e.name AS name, e.entity_type AS entityType`,
+      { projectId, codeNodeId },
+    );
+    return rows.map(r => ({
+      id: r.id as string,
+      name: r.name as string,
+      entityType: r.entityType as EntityType,
+    }));
+  }
+
+  /**
+   * v1.3.0 Phase 1 T1-6 helper: Close active DESCRIBES + DOCUMENTED_BY edges
+   * pointing to a CodeNode that is being superseded.
+   *
+   * Sets valid_to = datetime() and txn_to = datetime() on all currently-active
+   * (valid_to IS NULL) cross-domain edges incident to the given CodeNode.
+   *
+   * Called by supersedeRelation() in bitemporal-queries.ts when the target
+   * node is a CodeNode (incremental analysis replacing an old node with a
+   * new one).
+   */
+  async closeCrossDomainEdgesForCodeNode(
+    projectId: string,
+    codeNodeId: string,
+  ): Promise<void> {
+    await this.graph.query(
+      `MATCH (e:WikiEntity)-[d:DESCRIBES {projectId: $projectId}]->(c {id: $codeNodeId, projectId: $projectId})
+       WHERE d.valid_to IS NULL
+       SET d.valid_to = datetime(), d.txn_to = datetime()
+       WITH e
+       MATCH (c2 {id: $codeNodeId, projectId: $projectId})-[db:DOCUMENTED_BY {projectId: $projectId}]->(e)
+       WHERE db.valid_to IS NULL
+       SET db.valid_to = datetime(), db.txn_to = datetime()`,
+      { projectId, codeNodeId },
+    );
   }
 
   // ==========================================

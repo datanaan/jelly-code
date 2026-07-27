@@ -33,6 +33,8 @@ interface StoredEntity {
   first_compiled: string;
   last_updated: string;
   codeSignature: CodeSignature | null;
+  provenance: string | null;
+  derived_at: string | null;
 }
 
 /**
@@ -70,6 +72,8 @@ function createInMemoryStore(): IGraphStore & {
             first_compiled: params.firstCompiled as string,
             last_updated: params.lastUpdated as string,
             codeSignature: (params.codeSignature as CodeSignature | null) ?? null,
+            provenance: (params.provenance as string | null) ?? null,
+            derived_at: (params.derivedAt as string | null) ?? null,
           });
           return [];
         }
@@ -88,6 +92,8 @@ function createInMemoryStore(): IGraphStore & {
           if ('codeSignature' in params) {
             entity.codeSignature = (params.codeSignature as CodeSignature | null) ?? null;
           }
+          if ('provenance' in params) entity.provenance = (params.provenance as string | null) ?? null;
+          if ('derivedAt' in params) entity.derived_at = (params.derivedAt as string | null) ?? null;
           return [];
         }
 
@@ -131,6 +137,8 @@ function createInMemoryStore(): IGraphStore & {
           firstCompiled: e.first_compiled,
           lastUpdated: e.last_updated,
           codeSignature: e.codeSignature, // structured object, just like Neo4j returns it
+          provenance: e.provenance,
+          derivedAt: e.derived_at,
         }));
       }
 
@@ -424,5 +432,261 @@ describe('graph.ts codeSignature roundtrip', () => {
     );
     expect(writeCall).toBeDefined();
     expect(writeCall![0]).toContain('e.codeSignature = $codeSignature');
+  });
+
+  // ─── v1.3.0 Phase 1 T1-5: provenance roundtrip ──────────────────
+
+  it('T1-5: createEntity with provenance=manual → getEntity returns provenance', async () => {
+    const store = createInMemoryStore();
+    const graph = new WikiGraph(store);
+
+    await graph.createEntity(makeEntity({
+      id: 'entity-manual',
+      name: 'ManualEntity',
+      provenance: 'manual',
+    }));
+
+    const result = await graph.getEntity(PROJECT_ID, 'entity-manual');
+    expect(result).not.toBeNull();
+    expect(result!.provenance).toBe('manual');
+    expect(result!.derivedAt).toBeUndefined();
+  });
+
+  it('T1-5: createEntity with provenance=auto-derived + derivedAt → roundtrip', async () => {
+    const store = createInMemoryStore();
+    const graph = new WikiGraph(store);
+
+    await graph.createEntity(makeEntity({
+      id: 'entity-auto',
+      name: 'AutoEntity',
+      provenance: 'auto-derived',
+      derivedAt: '2026-07-22T10:00:00Z',
+    }));
+
+    const result = await graph.getEntity(PROJECT_ID, 'entity-auto');
+    expect(result).not.toBeNull();
+    expect(result!.provenance).toBe('auto-derived');
+    expect(result!.derivedAt).toBe('2026-07-22T10:00:00Z');
+  });
+
+  it('T1-5: entity without provenance → getEntity returns undefined (backward compat)', async () => {
+    const store = createInMemoryStore();
+    const graph = new WikiGraph(store);
+
+    await graph.createEntity(makeEntity({
+      id: 'entity-old',
+      name: 'OldEntity',
+      // no provenance field — pre-v1.3.0 data
+    }));
+
+    const result = await graph.getEntity(PROJECT_ID, 'entity-old');
+    expect(result).not.toBeNull();
+    expect(result!.provenance).toBeUndefined();
+    expect(result!.derivedAt).toBeUndefined();
+  });
+
+  it('T1-5: listEntities includes provenance in RETURN + result mapping', async () => {
+    const store = createInMemoryStore();
+    const graph = new WikiGraph(store);
+
+    await graph.createEntity(makeEntity({
+      id: 'entity-a',
+      name: 'Alpha',
+      provenance: 'manual',
+    }));
+    await graph.createEntity(makeEntity({
+      id: 'entity-b',
+      name: 'Beta',
+      provenance: 'auto-derived',
+      derivedAt: '2026-07-22T10:00:00Z',
+    }));
+
+    const results = await graph.listEntities(PROJECT_ID);
+    expect(results).toHaveLength(2);
+    expect(results[0].name).toBe('Alpha');
+    expect(results[0].provenance).toBe('manual');
+    expect(results[1].name).toBe('Beta');
+    expect(results[1].provenance).toBe('auto-derived');
+    expect(results[1].derivedAt).toBe('2026-07-22T10:00:00Z');
+  });
+
+  it('T1-5: updateEntity can change provenance', async () => {
+    const store = createInMemoryStore();
+    const graph = new WikiGraph(store);
+
+    await graph.createEntity(makeEntity({
+      id: 'entity-x',
+      name: 'X',
+      provenance: 'manual',
+    }));
+
+    await graph.updateEntity(PROJECT_ID, 'entity-x', {
+      provenance: 'human-verified',
+    });
+
+    const result = await graph.getEntity(PROJECT_ID, 'entity-x');
+    expect(result!.provenance).toBe('human-verified');
+  });
+});
+
+// ==========================================
+// v1.3.0 Phase 1: Cross-domain edges (DESCRIBES / DOCUMENTED_BY)
+// ==========================================
+
+describe('graph.ts cross-domain edges (v1.3.0 Phase 1)', () => {
+  it('createCrossDomainEdges: Cypher creates DESCRIBES + DOCUMENTED_BY with bi-temporal props', async () => {
+    const store = createInMemoryStore();
+    const graph = new WikiGraph(store);
+
+    const querySpy = vi.spyOn(store, 'query');
+
+    await graph.createCrossDomainEdges(
+      PROJECT_ID,
+      'entity-greet',
+      'codenode-greet-123',
+      'commit-abc',
+    );
+
+    // Find the cross-domain write call
+    const call = querySpy.mock.calls.find(
+      ([cypher]) => typeof cypher === 'string' && cypher.includes(':DESCRIBES') && cypher.includes(':DOCUMENTED_BY'),
+    );
+    expect(call).toBeDefined();
+    const cypher = call![0] as string;
+
+    // CK-5: bi-temporal properties present
+    expect(cypher).toContain('valid_from');
+    expect(cypher).toContain('txn_from');
+    expect(cypher).toContain('commitId');
+    expect(cypher).toContain('ON CREATE SET');
+
+    // CK-4: projectId isolation
+    expect(cypher).toContain('$projectId');
+
+    // Params include commitId
+    const params = call![1] as Record<string, unknown>;
+    expect(params.entityId).toBe('entity-greet');
+    expect(params.codeNodeId).toBe('codenode-greet-123');
+    expect(params.commitId).toBe('commit-abc');
+    expect(params.projectId).toBe(PROJECT_ID);
+  });
+
+  it('createCrossDomainEdges: commitId defaults to null when omitted', async () => {
+    const store = createInMemoryStore();
+    const graph = new WikiGraph(store);
+
+    const querySpy = vi.spyOn(store, 'query');
+
+    await graph.createCrossDomainEdges(PROJECT_ID, 'e1', 'c1');
+
+    const call = querySpy.mock.calls.find(
+      ([cypher]) => typeof cypher === 'string' && cypher.includes(':DESCRIBES'),
+    );
+    expect(call).toBeDefined();
+    const params = call![1] as Record<string, unknown>;
+    expect(params.commitId).toBeNull();
+  });
+
+  it('createCrossDomainEdges: uses MERGE + ON CREATE (idempotent — preserves original valid_from)', async () => {
+    const store = createInMemoryStore();
+    const graph = new WikiGraph(store);
+
+    const querySpy = vi.spyOn(store, 'query');
+
+    await graph.createCrossDomainEdges(PROJECT_ID, 'e1', 'c1');
+
+    const call = querySpy.mock.calls.find(
+      ([cypher]) => typeof cypher === 'string' && cypher.includes(':DESCRIBES'),
+    );
+    const cypher = call![0] as string;
+
+    // valid_from only set under ON CREATE — re-binding preserves original timestamp
+    expect(cypher).toContain('ON CREATE SET d.valid_from');
+    expect(cypher).toContain('ON CREATE SET db.valid_from');
+    // No bare SET that resets valid_from outside ON CREATE
+    const lines = cypher.split('\n').map(l => l.trim());
+    const bareSetLines = lines.filter(l =>
+      l.startsWith('SET d.valid_from') || l.startsWith('SET db.valid_from')
+    );
+    expect(bareSetLines).toEqual([]);
+  });
+
+  it('findDocumentedCodeNodes: Cypher traverses DESCRIBES edges with projectId scope', async () => {
+    const store = createInMemoryStore();
+    const graph = new WikiGraph(store);
+
+    const querySpy = vi.spyOn(store, 'query');
+
+    await graph.findDocumentedCodeNodes(PROJECT_ID, 'entity-greet');
+
+    const call = querySpy.mock.calls.find(
+      ([cypher]) => typeof cypher === 'string' && cypher.includes(':DESCRIBES'),
+    );
+    expect(call).toBeDefined();
+    const cypher = call![0] as string;
+
+    expect(cypher).toContain(':DESCRIBES');
+    expect(cypher).toContain('$projectId');
+    // activeOnly default true → valid_to IS NULL filter
+    expect(cypher).toContain('valid_to IS NULL');
+  });
+
+  it('findDocumentedCodeNodes: activeOnly=false includes superseded edges', async () => {
+    const store = createInMemoryStore();
+    const graph = new WikiGraph(store);
+
+    const querySpy = vi.spyOn(store, 'query');
+
+    await graph.findDocumentedCodeNodes(PROJECT_ID, 'entity-greet', false);
+
+    const call = querySpy.mock.calls.find(
+      ([cypher]) => typeof cypher === 'string' && cypher.includes(':DESCRIBES'),
+    );
+    const cypher = call![0] as string;
+    expect(cypher).not.toContain('valid_to IS NULL');
+  });
+
+  it('findDocumentingEntities: Cypher traverses DOCUMENTED_BY edges', async () => {
+    const store = createInMemoryStore();
+    const graph = new WikiGraph(store);
+
+    const querySpy = vi.spyOn(store, 'query');
+
+    await graph.findDocumentingEntities(PROJECT_ID, 'codenode-1');
+
+    const call = querySpy.mock.calls.find(
+      ([cypher]) => typeof cypher === 'string' && cypher.includes(':DOCUMENTED_BY'),
+    );
+    expect(call).toBeDefined();
+    const cypher = call![0] as string;
+
+    expect(cypher).toContain(':DOCUMENTED_BY');
+    expect(cypher).toContain('$projectId');
+    expect(cypher).toContain('valid_to IS NULL');
+  });
+
+  it('closeCrossDomainEdgesForCodeNode: SET valid_to + txn_to on active edges', async () => {
+    const store = createInMemoryStore();
+    const graph = new WikiGraph(store);
+
+    const querySpy = vi.spyOn(store, 'query');
+
+    await graph.closeCrossDomainEdgesForCodeNode(PROJECT_ID, 'codenode-old');
+
+    const call = querySpy.mock.calls.find(
+      ([cypher]) => typeof cypher === 'string'
+        && cypher.includes(':DESCRIBES') && cypher.includes(':DOCUMENTED_BY') && cypher.includes('valid_to = datetime()'),
+    );
+    expect(call).toBeDefined();
+    const cypher = call![0] as string;
+
+    // Both edge types are closed
+    expect(cypher).toContain('d.valid_to = datetime()');
+    expect(cypher).toContain('d.txn_to = datetime()');
+    expect(cypher).toContain('db.valid_to = datetime()');
+    expect(cypher).toContain('db.txn_to = datetime()');
+    // Only closes currently-active edges
+    expect(cypher).toContain('d.valid_to IS NULL');
+    expect(cypher).toContain('db.valid_to IS NULL');
   });
 });

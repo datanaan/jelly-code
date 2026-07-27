@@ -6,7 +6,7 @@
  * routing function used by the CLI call-processor, CLI parse-worker, and
  * the web call-processor so that the classification logic lives in one place.
  *
- * NOTE: This file is intentionally duplicated in the web module because the
+ * NOTE: This file is intentionally duplicated in the web client/ because the
  * two packages have separate build targets (Node native vs WASM/browser).
  * Keep both copies in sync until a shared package is introduced.
  */

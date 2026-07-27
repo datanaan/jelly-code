@@ -1,5 +1,5 @@
 /**
- * Ignore service.
+ * Ignore service — replaces jelly-code's ../../config/ignore-service.js
  *
  * Provides file filtering based on .gitignore and common exclusion patterns.
  * Used by the filesystem walker to skip irrelevant files during indexing.

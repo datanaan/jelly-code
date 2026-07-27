@@ -85,59 +85,61 @@ const parseEnrichmentResponse = (response: string, fallbackLabel: string): Clust
 // ============================================================================
 
 /**
- * Enrich clusters with LLM-generated names, keywords, and descriptions
+ * Enrich clusters with LLM-generated names, keywords, and descriptions.
+ *
+ * v1.4.0: This function now dispatches to the `llm-enrichment` BullMQ queue
+ * instead of making synchronous LLM calls. The returned `EnrichmentResult`
+ * contains only heuristic fallbacks for empty-member communities; the actual
+ * semantic enrichments are produced asynchronously by `llm-worker` and written
+ * directly to Neo4j. Callers that previously read the returned enrichments to
+ * update community nodes should now treat the return value as best-effort
+ * heuristic-only.
  *
  * @param communities - Community nodes to enrich
  * @param memberMap - Map of communityId -> member info
- * @param llmClient - LLM client for generation
+ * @param llmClient - LLM client (unused in async path, kept for backward compat)
  * @param onProgress - Progress callback
+ * @param projectId - Optional project ID for job dispatch (default 'unknown')
  */
 export const enrichClusters = async (
   communities: CommunityNode[],
   memberMap: Map<string, ClusterMemberInfo[]>,
   llmClient: LLMClient,
   onProgress?: (current: number, total: number) => void,
+  projectId?: string,
 ): Promise<EnrichmentResult> => {
+  // v1.4.0: async dispatch. Skip empty-member communities (heuristic fallback inline).
+  void llmClient;  // Unused in async path; kept for backward-compatible signature.
   const enrichments = new Map<string, ClusterEnrichment>();
-  let tokensUsed = 0;
+  const eligible: CommunityNode[] = [];
 
-  for (let i = 0; i < communities.length; i++) {
-    const community = communities[i];
-    const members = memberMap.get(community.id) || [];
-
-    onProgress?.(i + 1, communities.length);
-
+  for (const c of communities) {
+    const members = memberMap.get(c.id) || [];
     if (members.length === 0) {
-      // No members, use heuristic
-      enrichments.set(community.id, {
-        name: community.heuristicLabel,
-        keywords: [],
-        description: '',
-      });
-      continue;
-    }
-
-    try {
-      const prompt = buildEnrichmentPrompt(members, community.heuristicLabel);
-      const response = await llmClient.generate(prompt);
-
-      // Rough token estimate
-      tokensUsed += prompt.length / 4 + response.length / 4;
-
-      const enrichment = parseEnrichmentResponse(response, community.heuristicLabel);
-      enrichments.set(community.id, enrichment);
-    } catch (error) {
-      // On error, fallback to heuristic
-      console.warn(`Failed to enrich cluster ${community.id}:`, error);
-      enrichments.set(community.id, {
-        name: community.heuristicLabel,
-        keywords: [],
-        description: '',
-      });
+      enrichments.set(c.id, { name: c.heuristicLabel, keywords: [], description: '' });
+    } else {
+      eligible.push(c);
     }
   }
 
-  return { enrichments, tokensUsed };
+  if (eligible.length > 0) {
+    const { JobDispatcher } = await import('../resilience/job-dispatcher.js');
+    const { llmEnrichmentQueue } = await import('../queue-setup.js');
+    const dispatcher = new JobDispatcher();
+    const effectiveProjectId = projectId ?? 'unknown';
+    await dispatcher.dispatch(
+      llmEnrichmentQueue,
+      eligible,
+      (batch) => ({ projectId: effectiveProjectId, communityIds: batch.map(c => c.id) }),
+      { batchSize: 5, jobIdPrefix: `enrich-${effectiveProjectId}` },
+    );
+  }
+
+  // Note: actual enrichment happens in llm-worker async.
+  // The returned EnrichmentResult only contains heuristic fallbacks;
+  // semantic enrichments are written to Neo4j directly by the worker.
+  onProgress?.(communities.length, communities.length);
+  return { enrichments, tokensUsed: 0 };
 };
 
 // ============================================================================

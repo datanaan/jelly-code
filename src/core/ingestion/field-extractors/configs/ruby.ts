@@ -1,4 +1,4 @@
-// field-extractors/configs/ruby.ts
+// src/core/ingestion/field-extractors/configs/ruby.ts
 
 import { SupportedLanguages } from '@shared';
 import type { FieldExtractionConfig } from '../generic.js';

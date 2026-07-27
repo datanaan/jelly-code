@@ -1,4 +1,4 @@
-// field-extractors/configs/dart.ts
+// src/core/ingestion/field-extractors/configs/dart.ts
 
 import { SupportedLanguages } from '@shared';
 import type { FieldExtractionConfig } from '../generic.js';

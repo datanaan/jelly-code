@@ -1,4 +1,4 @@
-// method-types.ts
+// src/core/ingestion/method-types.ts
 
 import type { SupportedLanguages } from '@shared';
 import type { FieldVisibility } from './field-types.js';

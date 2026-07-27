@@ -78,6 +78,44 @@ describe('WikiEntity model — P0c-T2 extensions', () => {
     expect(entity.validFrom).toBeDefined();
     expect(entity.validTo).toBeDefined();
   });
+
+  it('accepts provenance "auto-derived" with derivedAt', () => {
+    const entity: WikiEntity = {
+      ...baseEntity,
+      provenance: 'auto-derived',
+      derivedAt: '2026-07-22T10:00:00Z',
+    };
+    expect(entity.provenance).toBe('auto-derived');
+    expect(entity.derivedAt).toBe('2026-07-22T10:00:00Z');
+  });
+
+  it('accepts provenance "manual"', () => {
+    const entity: WikiEntity = { ...baseEntity, provenance: 'manual' };
+    expect(entity.provenance).toBe('manual');
+    expect(entity.derivedAt).toBeUndefined();
+  });
+
+  it('accepts provenance "human-verified"', () => {
+    const entity: WikiEntity = { ...baseEntity, provenance: 'human-verified' };
+    expect(entity.provenance).toBe('human-verified');
+  });
+
+  it('loads old entity without provenance as undefined (backward compat)', () => {
+    // Simulate data from before v1.3.0 — no provenance field at all
+    const oldData = {
+      id: 'e1',
+      projectId: 'p1',
+      name: 'old-entity',
+      entityType: 'concept' as const,
+      definition: 'old',
+      details: 'old',
+      firstCompiled: '2020-01-01',
+      lastUpdated: '2020-01-01',
+    };
+    const entity = oldData as WikiEntity;
+    expect(entity.provenance).toBeUndefined();
+    expect(entity.derivedAt).toBeUndefined();
+  });
 });
 
 describe('LintIssue model — P0c-T2 extensions', () => {

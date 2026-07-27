@@ -59,6 +59,8 @@ import {
 import { computeMRO } from './mro-processor.js';
 import { processCommunities } from './community-processor.js';
 import { processProcesses } from './process-processor.js';
+import { enrichClusters } from './cluster-enricher.js';
+import type { ClusterMemberInfo } from './cluster-enricher.js';
 import { createResolutionContext } from './resolution-context.js';
 import { IncrementalFallbackError } from '../incremental-fallback-error.js';
 import { createASTCache } from './ast-cache.js';
@@ -1242,6 +1244,48 @@ async function runGraphAnalysisPhases(
       reason: 'leiden-algorithm',
     });
   });
+
+  // ── Phase 5.5: Community Enrichment ─────────────────────────────────
+  // v1.4.0: async LLM enrichment for community semantic names.
+  // Build memberMap from community-processor's memberships + graph node data,
+  // then dispatch to llm-enrichment queue via JobDispatcher.
+  // Actual enrichment is done by llm-worker (createLLMEnrichmentHandler).
+  // If enrichment is not needed (no LLM configured, or disabled), this is a no-op.
+  if (communityResult.communities.length > 0) {
+    onProgress({
+      phase: 'communities',
+      percent: 93,
+      message: 'Enriching communities with LLM...',
+      stats: { filesProcessed: totalFiles, totalFiles, nodesCreated: graph.nodeCount },
+    });
+
+    // Build memberMap: communityId → member info[]
+    const memberMap = new Map<string, ClusterMemberInfo[]>();
+    for (const membership of communityResult.memberships) {
+      const node = graph.getNode(membership.nodeId);
+      if (!node) continue;
+      const info: ClusterMemberInfo = {
+        name: (node.properties.name as string) ?? '',
+        filePath: (node.properties.filePath as string) ?? '',
+        type: node.label ?? '',
+      };
+      let list = memberMap.get(membership.communityId);
+      if (!list) {
+        list = [];
+        memberMap.set(membership.communityId, list);
+      }
+      list.push(info);
+    }
+
+    // Dispatch enrichment (async — results appear when llm-worker consumes)
+    await enrichClusters(
+      communityResult.communities,
+      memberMap,
+      null as any, // llmClient unused in async path
+      undefined,   // onProgress
+      undefined,   // projectId (not available here; worker handles it via job data)
+    );
+  }
 
   // ── Phase 6: Processes ─────────────────────────────────────────────
   onProgress({
